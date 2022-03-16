@@ -99,11 +99,11 @@ func (s *synapse) processMessage(msg []byte) {
 
 	switch message.Type {
 	case core.MsgError:
-		s.logger.Debugf("error message recieved from server")
+		s.logger.Debugf("error message received from server")
 	case core.MsgInfo:
-		s.logger.Debugf("info message recieved from server")
+		s.logger.Debugf("info message received from server")
 	case core.MsgTask:
-		s.logger.Debugf("task message recieved from server")
+		s.logger.Debugf("task message received from server")
 		go s.processTask(message)
 	default:
 		s.logger.Errorf("message type not found")
@@ -111,7 +111,6 @@ func (s *synapse) processMessage(msg []byte) {
 }
 
 func (s *synapse) processTask(message core.Message) {
-	s.logger.Debugf("processTask() called ")
 	var runnerOpts core.RunnerOptions
 	err := json.Unmarshal(message.Content, &runnerOpts)
 	if err != nil {
@@ -125,15 +124,12 @@ func (s *synapse) processTask(message core.Message) {
 		resourceStatsMessage := CreateJobUpdateMessage(jobInfo)
 		s.SendMessage(&resourceStatsMessage)
 	}
-	s.logger.Debugf("Mounting HostVolumePath")
 	// mounting secrets to container
 	runnerOpts.HostVolumePath = fmt.Sprintf("/tmp/synapse/data/%s", runnerOpts.ContainerName)
 
 	if err := utils.CreateDirectory(runnerOpts.HostVolumePath); err != nil {
 		s.logger.Errorf("error creating file directory: %v", err)
 	}
-	s.logger.Debugf("Mounting scretes")
-	s.logger.Debugf("Labels %+v", runnerOpts.Label)
 	if err := s.secretsManager.WriteGitSecrets(runnerOpts.HostVolumePath); err != nil {
 		s.logger.Errorf("error creating secrets %v", err)
 	}
@@ -141,7 +137,6 @@ func (s *synapse) processTask(message core.Message) {
 	if err := s.secretsManager.WriteRepoSecrets(runnerOpts.Label[Repo], runnerOpts.HostVolumePath); err != nil {
 		s.logger.Errorf("error creating repo secrets %v", err)
 	}
-	s.logger.Debugf("after WriteRepoSecrets() called ")
 	s.runAndUpdateJobStatus(runnerOpts)
 
 }

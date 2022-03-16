@@ -34,7 +34,8 @@ func (gm *gitManager) Clone(ctx context.Context, payload *core.Payload, cloneTok
 	repoLink := payload.RepoLink
 	repoItems := strings.Split(repoLink, "/")
 	repoName := repoItems[len(repoItems)-1]
-	commitID := payload.TargetCommit
+	orgName := repoItems[len(repoItems)-2]
+	commitID := payload.BuildTargetCommit
 	archiveURL, err := urlmanager.GetCloneURL(payload.GitProvider, repoLink, repoName, commitID)
 	if err != nil {
 		gm.logger.Errorf("failed to get clone url for provider %s, error %v", payload.GitProvider, err)
@@ -47,36 +48,17 @@ func (gm *gitManager) Clone(ctx context.Context, payload *core.Payload, cloneTok
 		return err
 	}
 
-	if err = os.Rename(repoName+"-"+commitID, global.RepoDir); err != nil {
+	filename := repoName + "-" + commitID
+	if payload.GitProvider == core.Bitbucket {
+		// commitID[:12] bitbucket shorthand commit sha
+		filename = orgName + "-" + repoName + "-" + commitID[:12]
+	}
+
+	if err = os.Rename(filename, global.RepoDir); err != nil {
 		gm.logger.Errorf("failed to rename dir, error %v", err)
 		return err
 	}
 
-	return nil
-}
-
-func (gm *gitManager) CloneYML(ctx context.Context, payload *core.Payload, cloneToken string) error {
-	if err := os.Mkdir(global.RepoDir, os.ModePerm); err != nil {
-		gm.logger.Errorf("failed to create dir %s, error: %v", global.RepoDir, err)
-		return err
-	}
-
-	commitID := payload.BuildTargetCommit
-	archiveURL, err := urlmanager.GetDownloadURL(payload.GitProvider, payload.RepoSlug, commitID, payload.TasFileName)
-	if err != nil {
-		gm.logger.Errorf("failed to get download url for provider %s, error %v", payload.GitProvider, err)
-		return err
-	}
-	tasConfigFilePath := commitID + payload.TasFileName
-	if err := gm.downloadFile(ctx, archiveURL, commitID+payload.TasFileName, cloneToken); err != nil {
-		gm.logger.Errorf("error while cloning yaml for commitID %s, error: %v", commitID, err)
-		return err
-	}
-	gm.logger.Debugf("downloaded yaml file %s", tasConfigFilePath)
-	if err := os.Rename(tasConfigFilePath, filepath.Join(global.RepoDir, tasConfigFilePath)); err != nil {
-		gm.logger.Errorf("failed to move dir commitID %s, error: %v", err)
-		return err
-	}
 	return nil
 }
 
@@ -113,6 +95,7 @@ func (gm *gitManager) downloadFile(ctx context.Context, archiveURL, fileName, cl
 func (gm *gitManager) copyAndExtractFile(resp *http.Response, path string) error {
 	out, err := os.Create(path)
 	if err != nil {
+		gm.logger.Errorf("failed to create file err %v", err)
 		return err
 	}
 	_, err = io.Copy(out, resp.Body)

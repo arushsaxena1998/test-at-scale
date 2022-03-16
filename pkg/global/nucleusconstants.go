@@ -2,18 +2,25 @@ package global
 
 import "time"
 
+// TestEnv : to set test env for urlmanager package
+var TestEnv bool = false
+
+// TestServer : store server URL of test server while doing mock testing
+var TestServer string
+
 // All constant related to nucleus
 const (
-	CodeCoveragParentDir     = "/coverage"
 	CoverageManifestFileName = "manifest.json"
 	HomeDir                  = "/home/nucleus"
+	WorkspaceCacheDir        = "/workspace-cache"
 	RepoDir                  = HomeDir + "/repo"
+	CodeCoverageDir          = RepoDir + "/coverage"
 	DefaultHTTPTimeout       = 45 * time.Second
 	SamplingTime             = 5 * time.Millisecond
 	RepoSecretPath           = "/vault/secrets/reposecrets"
 	OauthSecretPath          = "/vault/secrets/oauth"
 	NeuronRemoteHost         = "http://neuron-service.phoenix"
-	BlocklistedFileLocation  = "/scripts/blocklist.json"
+	BlockTestFileLocation    = RepoDir + "/blocktests.json"
 	SecretRegex              = `\${{\s*secrets\.(.*?)\s*}}`
 	ExecutionResultChunkSize = 50
 	TestLocatorsDelimiter    = "#TAS#"
@@ -26,15 +33,11 @@ var FrameworkRunnerMap = map[string]string{
 	"jest":    "./node_modules/.bin/jest-runner",
 }
 
-// RawContentURLMap is map of git provider with there raw content url
-var RawContentURLMap = map[string]string{
-	"github": "https://raw.githubusercontent.com",
-}
-
 // APIHostURLMap is map of git provider with there api url
 var APIHostURLMap = map[string]string{
-	"github": "https://api.github.com/repos",
-	"gitlab": "https://gitlab.com/api/v4/projects",
+	"github":    "https://api.github.com/repos",
+	"gitlab":    "https://gitlab.com/api/v4/projects",
+	"bitbucket": "https://api.bitbucket.org/2.0",
 }
 
 // InstallRunnerCmd  are list of command used to install custom runner

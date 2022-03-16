@@ -9,7 +9,6 @@ import (
 	"strings"
 
 	"github.com/LambdaTest/synapse/pkg/core"
-	"github.com/LambdaTest/synapse/pkg/global"
 	"github.com/LambdaTest/synapse/pkg/lumber"
 )
 
@@ -42,14 +41,14 @@ func (z *zstdCompressor) createManifestFile(workingDir string, fileNames ...stri
 // Compress compress the list of files
 func (z *zstdCompressor) Compress(ctx context.Context, compressedFileName string, preservePath bool, workingDirectory string, filesToCompress ...string) error {
 	if err := z.createManifestFile(workingDirectory, filesToCompress...); err != nil {
-		z.logger.Errorf("failed to create mainfest file %v", err)
+		z.logger.Errorf("failed to create manifest file %v", err)
 		return err
 	}
 	args := []string{z.execPath, "--posix", "-I", "'zstd -5 -T0'", "-cf", compressedFileName, "-C", workingDirectory, "-T", filepath.Join(os.TempDir(), manifestFileName)}
 	if preservePath {
 		args = append(args, "-P")
 	}
-	if err := z.execManager.ExecuteInternalCommands(ctx, core.Zstd, args, global.RepoDir, nil, nil); err != nil {
+	if err := z.execManager.ExecuteInternalCommands(ctx, core.Zstd, args, workingDirectory, nil, nil); err != nil {
 		z.logger.Errorf("error while zstd compression %v", err)
 		return err
 	}
@@ -62,7 +61,7 @@ func (z *zstdCompressor) Decompress(ctx context.Context, filePath string, preser
 	if preservePath {
 		args = append(args, "-P")
 	}
-	if err := z.execManager.ExecuteInternalCommands(ctx, core.Zstd, args, global.RepoDir, nil, nil); err != nil {
+	if err := z.execManager.ExecuteInternalCommands(ctx, core.Zstd, args, workingDirectory, nil, nil); err != nil {
 		z.logger.Errorf("error while zstd decompression %v", err)
 		return err
 	}

@@ -9,6 +9,7 @@ import (
 	"github.com/LambdaTest/synapse/pkg/global"
 	"github.com/LambdaTest/synapse/pkg/logstream"
 	"github.com/LambdaTest/synapse/pkg/lumber"
+	"github.com/LambdaTest/synapse/pkg/utils"
 )
 
 type testDiscoveryService struct {
@@ -26,7 +27,8 @@ func (tds *testDiscoveryService) Discover(ctx context.Context,
 	tasConfig *core.TASConfig,
 	payload *core.Payload,
 	secretData map[string]string,
-	diff map[string]int) error {
+	diff map[string]int,
+	diffExists bool) error {
 	var target []string
 	var envMap map[string]string
 	if payload.EventType == core.EventPullRequest {
@@ -37,19 +39,28 @@ func (tds *testDiscoveryService) Discover(ctx context.Context,
 		envMap = tasConfig.Postmerge.EnvMap
 	}
 	tasYmlModified := false
-	if _, ok := diff[payload.TasFileName]; ok {
+	configFilePath, err := utils.GetConfigFileName(payload.TasFileName)
+	if err != nil {
+		return err
+	}
+	if _, ok := diff[configFilePath]; ok {
 		tasYmlModified = true
 	}
 
-	// discover all tests if tas.yml modified or if parent commit does not exists or smart run feature is set to false
-	discoverAll := tasYmlModified || !payload.ParentCommitCoverageExists || !tasConfig.SmartRun
+	// discover all tests if tas.yml modified or smart run feature is set to false
+	discoverAll := tasYmlModified || !tasConfig.SmartRun
 
 	args := []string{"--command", "discover"}
 	if !discoverAll {
-		for k, v := range diff {
-			// in changed files we only have added or modified files.
-			if v != core.FileRemoved {
-				args = append(args, "--diff", k)
+		if len(diff) == 0 && diffExists {
+			// empty diff; in PR, a commit added and then reverted to cause an overall empty PR diff
+			args = append(args, "--diff")
+		} else {
+			for k, v := range diff {
+				// in changed files we only have added or modified files.
+				if v != core.FileRemoved {
+					args = append(args, "--diff", k)
+				}
 			}
 		}
 	}

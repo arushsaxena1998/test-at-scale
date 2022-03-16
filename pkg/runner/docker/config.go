@@ -2,11 +2,13 @@ package docker
 
 import (
 	"context"
-	"io"
+	"fmt"
 	"os"
+	"strconv"
 
-	"github.com/LambdaTest/synapse/config"
 	"github.com/LambdaTest/synapse/pkg/core"
+	"github.com/LambdaTest/synapse/pkg/global"
+	"github.com/LambdaTest/synapse/pkg/synapse"
 	"github.com/LambdaTest/synapse/pkg/utils"
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
@@ -16,38 +18,14 @@ import (
 )
 
 const (
-	networkName                = "test-at-scale"
-	defaultContainerVolumePath = "/coverage"
-	defaultVaultPath           = "/vault/secrets"
-	coverageSourcePath         = "/tmp/synapse/coverage"
-	nanoCPUUnit                = 1e9
+	defaultVaultPath = "/vault/secrets"
+	repoSourcePath   = "/tmp/synapse/%s/nucleus"
+	nanoCPUUnit      = 1e9
 	// GB defines number of bytes in 1 GB
 	GB int64 = 1e+9
 )
 
-func (d *docker) getContainerConfiguration(r *core.RunnerOptions) (*container.Config, error) {
-	containerImageConfig, err := d.secretsManager.GetDockerSecrets(r)
-	if err != nil {
-		d.logger.Errorf("Something went wrong while seeking container config %+v", err)
-	}
-
-	r.ContainerArgs = append(r.ContainerArgs, "--local", "true")
-	localIp := utils.GetOutboundIP()
-	r.ContainerArgs = append(r.ContainerArgs, "--synapsehost", localIp)
-	if containerImageConfig.PullPolicy == config.PullNever && r.PodType == core.NucleusPod {
-		d.logger.Infof("pull policy %s, not pulling any image", containerImageConfig.PullPolicy)
-		return &container.Config{
-			Image:   r.DockerImage,
-			Env:     r.Env,
-			Tty:     false,
-			Cmd:     r.ContainerArgs,
-			Volumes: make(map[string]struct{}),
-		}, nil
-	}
-	if err := d.PullImage(&containerImageConfig); err != nil {
-		d.logger.Errorf("Something went wrong while pulling image %s", err)
-		return nil, err
-	}
+func (d *docker) getContainerConfiguration(r *core.RunnerOptions) *container.Config {
 
 	return &container.Config{
 		Image:   r.DockerImage,
@@ -55,39 +33,10 @@ func (d *docker) getContainerConfiguration(r *core.RunnerOptions) (*container.Co
 		Tty:     false,
 		Cmd:     r.ContainerArgs,
 		Volumes: make(map[string]struct{}),
-	}, nil
-}
-
-func (d *docker) PullImage(containerImageConfig *core.ContainerImageConfig) error {
-	dockerImage := containerImageConfig.Image
-
-	d.logger.Infof("Pulling image : %s", dockerImage)
-	ImagePullOptions := types.ImagePullOptions{}
-	ImagePullOptions.RegistryAuth = containerImageConfig.AuthRegistry
-	reader, err := d.client.ImagePull(context.TODO(), dockerImage, ImagePullOptions)
-	defer func() {
-		if reader == nil {
-			d.logger.Errorf("Reader returned by docker pull is null")
-			return
-		}
-		if err := reader.Close(); err != nil {
-			d.logger.Errorf(err.Error())
-		}
-	}()
-
-	if err != nil {
-		return err
 	}
-	if _, err := io.Copy(os.Stdout, reader); err != nil {
-		return err
-	}
-	return nil
 }
 
 func (d *docker) getContainerHostConfiguration(r *core.RunnerOptions) *container.HostConfig {
-	if err := utils.CreateDirectory(coverageSourcePath); err != nil {
-		d.logger.Errorf("error creating directory: %v", err)
-	}
 	specs := getSpces(r.Tier)
 	/*
 		https://pkg.go.dev/github.com/docker/docker@v20.10.12+incompatible/api/types/container#Resources
@@ -95,23 +44,39 @@ func (d *docker) getContainerHostConfiguration(r *core.RunnerOptions) *container
 	*/
 	nanoCPU := int64(specs.CPU * nanoCPUUnit)
 	d.logger.Infof("Specs %+v", specs)
-	return &container.HostConfig{
-		Mounts: []mount.Mount{
-			{
-				Type:   mount.TypeBind,
-				Source: coverageSourcePath,
-				Target: defaultContainerVolumePath,
-			},
-			{
-				Type:   mount.TypeBind,
-				Source: r.HostVolumePath,
-				Target: defaultVaultPath,
-			},
+	mounts := []mount.Mount{
+		{
+			Type:   mount.TypeBind,
+			Source: r.HostVolumePath,
+			Target: defaultVaultPath,
 		},
+	}
+	if r.PodType == core.NucleusPod || r.PodType == core.CoveragePod {
+		repoBuildSourcePath := fmt.Sprintf(repoSourcePath, r.Label[synapse.BuildID])
+		if err := utils.CreateDirectory(repoBuildSourcePath); err != nil {
+			d.logger.Errorf("error creating directory: %v", err)
+		}
+		mounts = append(mounts, mount.Mount{
+			Type:   mount.TypeBind,
+			Source: repoBuildSourcePath,
+			Target: global.WorkspaceCacheDir,
+		})
+	}
+	hostConfig := container.HostConfig{
+		Mounts:      mounts,
 		AutoRemove:  true,
 		SecurityOpt: []string{"seccomp=unconfined"},
 		Resources:   container.Resources{Memory: specs.RAM * GB, NanoCPUs: nanoCPU},
 	}
+
+	autoRemove, err := strconv.ParseBool(os.Getenv(global.AutoRemoveEnv))
+	if err != nil {
+		d.logger.Errorf("Error reading os env AutoRemove with error: %v \n returning default host config", err)
+		return &hostConfig
+
+	}
+	hostConfig.AutoRemove = autoRemove
+	return &hostConfig
 }
 
 func (d *docker) getContainerNetworkConfiguration() (*network.NetworkingConfig, error) {

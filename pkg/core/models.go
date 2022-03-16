@@ -87,8 +87,6 @@ type Payload struct {
 	RepoLink                   string             `json:"repo_link"`
 	BuildTargetCommit          string             `json:"build_target_commit"`
 	BuildBaseCommit            string             `json:"build_base_commit"`
-	TargetCommit               string             `json:"-"`
-	BaseCommit                 string             `json:"-"`
 	TaskID                     string             `json:"task_id"`
 	BranchName                 string             `json:"branch_name"`
 	BuildID                    string             `json:"build_id"`
@@ -106,6 +104,7 @@ type Payload struct {
 	ParentCommitCoverageExists bool               `json:"parent_commit_coverage_exists"`
 	LicenseTier                Tier               `json:"license_tier"`
 	CollectCoverage            bool               `json:"collect_coverage"`
+	CollectStats               bool               `json:"collect_stats"`
 }
 
 // Pipeline defines all attributes of Pipeline
@@ -120,7 +119,7 @@ type Pipeline struct {
 	DiffManager          DiffManager
 	CacheStore           CacheStore
 	TestDiscoveryService TestDiscoveryService
-	TestBlockListService TestBlockListService
+	BlockTestService     BlockTestService
 	TestExecutionService TestExecutionService
 	ParserService        YMLParserService
 	CoverageService      CoverageService
@@ -132,13 +131,18 @@ type Pipeline struct {
 
 // ExecutionResult represents the request body for test and test suite execution
 type ExecutionResult struct {
-	TaskID           string             `json:"taskID"`
-	BuildID          string             `json:"buildID"`
-	RepoID           string             `json:"repoID"`
-	OrgID            string             `json:"orgID"`
-	CommitID         string             `json:"commitID"`
 	TestPayload      []TestPayload      `json:"testResults"`
 	TestSuitePayload []TestSuitePayload `json:"testSuiteResults"`
+}
+
+// ExecutionResults represents collection of execution results
+type ExecutionResults struct {
+	TaskID   string            `json:"taskID"`
+	BuildID  string            `json:"buildID"`
+	RepoID   string            `json:"repoID"`
+	OrgID    string            `json:"orgID"`
+	CommitID string            `json:"commitID"`
+	Results  []ExecutionResult `json:"results"`
 }
 
 // TestPayload represents the request body for test execution
@@ -238,8 +242,8 @@ type TaskPayload struct {
 	Type        TaskType  `json:"type"`
 }
 
-//CoverageMainfest for post processing coverage job
-type CoverageMainfest struct {
+// CoverageManifest for post processing coverage job
+type CoverageManifest struct {
 	Removedfiles      []string           `json:"removed_files"`
 	AllFilesExecuted  bool               `json:"all_files_executed"`
 	CoverageThreshold *CoverageThreshold `json:"coverage_threshold,omitempty"`
@@ -259,9 +263,11 @@ const (
 	GitHub string = "github"
 	// GitLab as git provider
 	GitLab string = "gitlab"
+	// Bitbucket as git provider
+	Bitbucket string = "bitbucket"
 )
 
-// Oauth repersents the sructure of Oauth
+// Oauth represents the sructure of Oauth
 type Oauth struct {
 	Data struct {
 		AccessToken  string    `json:"access_token"`
@@ -270,7 +276,7 @@ type Oauth struct {
 	} `json:"data"`
 }
 
-//TASConfig represents the .tas.yml file
+// TASConfig represents the .tas.yml file
 type TASConfig struct {
 	SmartRun          bool               `yaml:"smartRun"`
 	Framework         string             `yaml:"framework" validate:"required,oneof=jest mocha jasmine"`
@@ -311,7 +317,7 @@ type Modifier struct {
 	Cli    string
 }
 
-// Run repersents  pre and post runs
+// Run represents  pre and post runs
 type Run struct {
 	Commands []string          `yaml:"command" validate:"omitempty,gt=0"`
 	EnvMap   map[string]string `yaml:"env" validate:"omitempty,gt=0"`
@@ -335,4 +341,12 @@ type TaskType string
 const (
 	DiscoveryTask TaskType = "discover"
 	ExecutionTask TaskType = "execute"
+)
+
+// TestStatus stores tests status
+type TestStatus string
+
+const (
+	Blocklisted TestStatus = "blocklisted"
+	Quarantined TestStatus = "quarantined"
 )

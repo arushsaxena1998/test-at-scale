@@ -78,11 +78,11 @@ func (pl *Pipeline) Start(ctx context.Context) (err error) {
 	// set payload on pipeline object
 	pl.Payload = payload
 	if pl.Cfg.ParseMode {
-		err = pl.GitManager.CloneYML(ctx, payload, oauth.Data.AccessToken)
+		err = pl.GitManager.Clone(ctx, payload, oauth.Data.AccessToken)
 		if err != nil {
 			pl.Logger.Fatalf("failed to clone YML for build ID: %s, error: %v", payload.BuildID, err)
 		}
-		if err = pl.ParserService.PerformParsing(payload); err != nil {
+		if err = pl.ParserService.ParseAndValidate(ctx, payload); err != nil {
 			pl.Logger.Fatalf("error while parsing YML for build ID: %s, error: %v", payload.BuildID, err)
 		}
 		os.Exit(0)
@@ -95,7 +95,6 @@ func (pl *Pipeline) Start(ctx context.Context) (err error) {
 		RepoLink:    payload.RepoLink,
 		OrgID:       payload.OrgID,
 		RepoID:      payload.RepoID,
-		CommitID:    payload.TargetCommit,
 		GitProvider: payload.GitProvider,
 		StartTime:   startTime,
 		Status:      Running,
@@ -117,7 +116,7 @@ func (pl *Pipeline) Start(ctx context.Context) (err error) {
 		if p := recover(); p != nil {
 			pl.Logger.Errorf("panic stack trace: %v", p)
 			taskPayload.Status = Error
-			taskPayload.Remark = errs.GenericUserFacingBEErrRemark
+			taskPayload.Remark = errs.GenericErrRemark.Error()
 		} else if err != nil {
 			if err == context.Canceled {
 				taskPayload.Status = Aborted
@@ -132,13 +131,22 @@ func (pl *Pipeline) Start(ctx context.Context) (err error) {
 		}
 	}()
 
-	coverageDir := filepath.Join(global.CodeCoveragParentDir, payload.OrgID, payload.RepoID, payload.TargetCommit)
-	pl.Logger.Infof("Cloning repo ...")
-	err = pl.GitManager.Clone(ctx, pl.Payload, oauth.Data.AccessToken)
-	if err != nil {
-		pl.Logger.Errorf("Unable to clone repo '%s': %s", payload.RepoLink, err)
-		errRemark = fmt.Sprintf("Unable to clone repo: %s", payload.RepoLink)
-		return err
+	if pl.Cfg.DiscoverMode {
+		pl.Logger.Infof("Cloning repo ...")
+		err = pl.GitManager.Clone(ctx, pl.Payload, oauth.Data.AccessToken)
+		if err != nil {
+			pl.Logger.Errorf("Unable to clone repo '%s': %s", payload.RepoLink, err)
+			errRemark = fmt.Sprintf("Unable to clone repo: %s", payload.RepoLink)
+			return err
+		}
+	} else {
+		pl.Logger.Debugf("Extracting workspace")
+		// Replicate workspace
+		if err = pl.CacheStore.ExtractWorkspace(ctx); err != nil {
+			pl.Logger.Errorf("Error replicating workspace: %+v", err)
+			errRemark = errs.GenericErrRemark.Error()
+			return err
+		}
 	}
 
 	// load tas yaml file
@@ -149,14 +157,17 @@ func (pl *Pipeline) Start(ctx context.Context) (err error) {
 		return err
 	}
 
+	coverageDir := filepath.Join(global.CodeCoverageDir, payload.OrgID, payload.RepoID, payload.BuildTargetCommit)
+	cacheKey := fmt.Sprintf("%s/%s/%s", payload.OrgID, payload.RepoID, tasConfig.Cache.Key)
+
 	pl.Logger.Infof("Tas yaml: %+v", tasConfig)
 
 	// set testing taskID, orgID and buildID as environment variable
 	os.Setenv("TASK_ID", payload.TaskID)
 	os.Setenv("ORG_ID", payload.OrgID)
 	os.Setenv("BUILD_ID", payload.BuildID)
-	//set commit_id as environment variable
-	os.Setenv("COMMIT_ID", payload.TargetCommit)
+	//set target commit_id as environment variable
+	os.Setenv("COMMIT_ID", payload.BuildTargetCommit)
 	//set repo_id as environment variable
 	os.Setenv("REPO_ID", payload.RepoID)
 	//set coverage_dir as environment variable
@@ -167,7 +178,7 @@ func (pl *Pipeline) Start(ctx context.Context) (err error) {
 	os.Setenv("ENDPOINT_POST_TEST_LIST", endpointPostTestList)
 	os.Setenv("ENDPOINT_POST_TEST_RESULTS", endpointPostTestResults)
 	os.Setenv("REPO_ROOT", global.RepoDir)
-	os.Setenv("BLOCKLISTED_TESTS_FILE", global.BlocklistedFileLocation)
+	os.Setenv("BLOCK_TESTS_FILE", global.BlockTestFileLocation)
 
 	if tasConfig.NodeVersion != nil {
 		nodeVersion := tasConfig.NodeVersion.String()
@@ -180,7 +191,7 @@ func (pl *Pipeline) Start(ctx context.Context) (err error) {
 		err = pl.ExecutionManager.ExecuteInternalCommands(ctx, InstallNodeVer, command, "", nil, nil)
 		if err != nil {
 			pl.Logger.Errorf("Unable to install user-defined nodeversion %v", err)
-			errRemark = errs.GenericUserFacingBEErrRemark
+			errRemark = errs.GenericErrRemark.Error()
 			return err
 		}
 		origPath := os.Getenv("PATH")
@@ -190,61 +201,64 @@ func (pl *Pipeline) Start(ctx context.Context) (err error) {
 	if payload.CollectCoverage {
 		if err = fileutils.CreateIfNotExists(coverageDir, true); err != nil {
 			pl.Logger.Errorf("failed to create coverage directory %v", err)
-			errRemark = errs.GenericUserFacingBEErrRemark
+			errRemark = errs.GenericErrRemark.Error()
 			return err
 		}
-	}
-
-	err = pl.TestBlockListService.GetBlockListedTests(ctx, tasConfig, payload.RepoID)
-	if err != nil {
-		pl.Logger.Errorf("Unable to fetch blocklisted tests: %v", err)
-		errRemark = errs.GenericUserFacingBEErrRemark
-		return err
 	}
 
 	// read secrets
 	secretMap, err := pl.SecretParser.GetRepoSecret(global.RepoSecretPath)
 	if err != nil {
 		pl.Logger.Errorf("Error in fetching Repo secrets %v", err)
-		errRemark = errs.GenericUserFacingBEErrRemark
-		return err
-	}
-
-	cacheKey := fmt.Sprintf("%s/%s/%s", payload.OrgID, payload.RepoID, tasConfig.Cache.Key)
-	// TODO:  download from cdn
-	if err = pl.CacheStore.Download(ctx, cacheKey); err != nil {
-		pl.Logger.Errorf("Unable to download cache: %v", err)
-		errRemark = errs.GenericUserFacingBEErrRemark
-		return err
-	}
-
-	if tasConfig.Prerun != nil {
-		pl.Logger.Infof("Running pre-run steps")
-		err = pl.ExecutionManager.ExecuteUserCommands(ctx, PreRun, payload, tasConfig.Prerun, secretMap)
-		if err != nil {
-			pl.Logger.Errorf("Unable to run pre-run steps %v", err)
-			errRemark = "Error occurred in pre-run steps"
-			return err
-		}
-	}
-	err = pl.ExecutionManager.ExecuteInternalCommands(ctx, InstallRunners, global.InstallRunnerCmd, global.RepoDir, nil, nil)
-	if err != nil {
-		pl.Logger.Errorf("Unable to install custom runners %v", err)
-		errRemark = errs.GenericUserFacingBEErrRemark
+		errRemark = errs.GenericErrRemark.Error()
 		return err
 	}
 
 	if pl.Cfg.DiscoverMode {
-		pl.Logger.Infof("Identifying changed files ...")
-		diff, err := pl.DiffManager.GetChangedFiles(ctx, payload, oauth.Data.AccessToken)
+		err = pl.BlockTestService.GetBlockTests(ctx, tasConfig, payload.RepoID, payload.BranchName)
 		if err != nil {
-			pl.Logger.Errorf("Unable to identify changed files %s", err)
-			errRemark = "Error occurred in fetching diff from GitHub"
+			pl.Logger.Errorf("Unable to fetch blocklisted tests: %v", err)
+			errRemark = errs.GenericErrRemark.Error()
 			return err
 		}
 
+		if err = pl.CacheStore.Download(ctx, cacheKey); err != nil {
+			pl.Logger.Errorf("Unable to download cache: %v", err)
+			errRemark = errs.GenericErrRemark.Error()
+			return err
+		}
+
+		if tasConfig.Prerun != nil {
+			pl.Logger.Infof("Running pre-run steps")
+			err = pl.ExecutionManager.ExecuteUserCommands(ctx, PreRun, payload, tasConfig.Prerun, secretMap)
+			if err != nil {
+				pl.Logger.Errorf("Unable to run pre-run steps %v", err)
+				errRemark = "Error occurred in pre-run steps"
+				return err
+			}
+		}
+		err = pl.ExecutionManager.ExecuteInternalCommands(ctx, InstallRunners, global.InstallRunnerCmd, global.RepoDir, nil, nil)
+		if err != nil {
+			pl.Logger.Errorf("Unable to install custom runners %v", err)
+			errRemark = errs.GenericErrRemark.Error()
+			return err
+		}
+
+		pl.Logger.Infof("Identifying changed files ...")
+		diffExists := true
+		diff, err := pl.DiffManager.GetChangedFiles(ctx, payload, oauth.Data.AccessToken)
+		if err != nil {
+			if errors.Is(err, errs.ErrGitDiffNotFound) {
+				diffExists = false
+			} else {
+				pl.Logger.Errorf("Unable to identify changed files %s", err)
+				errRemark = "Error occurred in fetching diff from GitHub"
+				return err
+			}
+		}
+
 		// discover test cases
-		err = pl.TestDiscoveryService.Discover(ctx, tasConfig, pl.Payload, secretMap, diff)
+		err = pl.TestDiscoveryService.Discover(ctx, tasConfig, pl.Payload, secretMap, diff, diffExists)
 		if err != nil {
 			pl.Logger.Errorf("Unable to perform test discovery: %+v", err)
 			errRemark = "Error occurred in discovering tests"
@@ -253,30 +267,41 @@ func (pl *Pipeline) Start(ctx context.Context) (err error) {
 		// mark status as passed
 		taskPayload.Status = Passed
 
+		pl.Logger.Debugf("Caching workspace")
+		// Persist workspace
+		if err = pl.CacheStore.CacheWorkspace(ctx); err != nil {
+			pl.Logger.Errorf("Error caching workspace: %+v", err)
+			errRemark = errs.GenericErrRemark.Error()
+			return err
+		}
+
+		// Upload cache once for other builds
+		if err = pl.CacheStore.Upload(ctx, cacheKey, tasConfig.Cache.Paths...); err != nil {
+			pl.Logger.Errorf("Unable to upload cache: %v", err)
+			errRemark = errs.GenericErrRemark.Error()
+			return err
+		}
+		pl.Logger.Debugf("Cache uploaded successfully")
 	}
 
 	if pl.Cfg.ExecuteMode {
+
+		pl.Logger.Debugf("execute Mode")
 		// execute test cases
-		executionResult, err := pl.TestExecutionService.Run(ctx, tasConfig, pl.Payload, coverageDir, secretMap)
+		executionResults, err := pl.TestExecutionService.Run(ctx, tasConfig, pl.Payload, coverageDir, secretMap)
 		if err != nil {
 			pl.Logger.Infof("Unable to perform test execution: %v", err)
 			errRemark = "Error occurred in executing tests"
 			return err
 		}
 
-		if err = pl.sendStats(*executionResult); err != nil {
+		if err = pl.sendStats(*executionResults); err != nil {
 			pl.Logger.Errorf("error while sending test reports %v", err)
-			errRemark = errs.GenericUserFacingBEErrRemark
+			errRemark = errs.GenericErrRemark.Error()
 			return err
 		}
-		taskPayload.Status = Passed
-		for i := 0; i < len(executionResult.TestPayload); i++ {
-			testResult := &executionResult.TestPayload[i]
-			if testResult.Status == "failed" {
-				taskPayload.Status = Failed
-				break
-			}
-		}
+
+		taskPayload.Status = findTaskPayloadStatus(executionResults)
 
 		if tasConfig.Postrun != nil {
 			pl.Logger.Infof("Running post-run steps")
@@ -288,18 +313,24 @@ func (pl *Pipeline) Start(ctx context.Context) (err error) {
 			}
 		}
 	}
-	if err = pl.CacheStore.Upload(ctx, cacheKey, tasConfig.Cache.Paths...); err != nil {
-		pl.Logger.Errorf("Unable to upload cache: %v", err)
-		errRemark = errs.GenericUserFacingBEErrRemark
-		return err
-	}
-	pl.Logger.Debugf("Cache uploaded successfully")
 	pl.Logger.Debugf("Completed pipeline")
 
 	return nil
 }
 
-func (pl *Pipeline) sendStats(payload ExecutionResult) error {
+func findTaskPayloadStatus(executionResults *ExecutionResults) Status {
+	for _, result := range executionResults.Results {
+		for i := 0; i < len(result.TestPayload); i++ {
+			testResult := &result.TestPayload[i]
+			if testResult.Status == "failed" {
+				return Failed
+			}
+		}
+	}
+	return Passed
+}
+
+func (pl *Pipeline) sendStats(payload ExecutionResults) error {
 	reqBody, err := json.Marshal(payload)
 	if err != nil {
 		pl.Logger.Errorf("failed to marshal request body %v", err)

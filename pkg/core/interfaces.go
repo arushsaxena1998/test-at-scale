@@ -23,8 +23,6 @@ type TASConfigManager interface {
 type GitManager interface {
 	// Clone repository from TAS config
 	Clone(ctx context.Context, payload *Payload, cloneToken string) error
-	// CloneYML  clones all .tas.yml for all  the commits
-	CloneYML(ctx context.Context, payload *Payload, cloneToken string) error
 }
 
 // DiffManager manages the diff findings for the given payload
@@ -35,18 +33,18 @@ type DiffManager interface {
 // TestDiscoveryService services discovery of tests
 type TestDiscoveryService interface {
 	// Discover executes the test discovery scripts.
-	Discover(ctx context.Context, tasConfig *TASConfig, payload *Payload, secretData map[string]string, diff map[string]int) error
+	Discover(ctx context.Context, tasConfig *TASConfig, payload *Payload, secretData map[string]string, diff map[string]int, diffExists bool) error
 }
 
-// TestBlockListService is used for fetching blocklisted tests
-type TestBlockListService interface {
-	GetBlockListedTests(ctx context.Context, tasConfig *TASConfig, repo string) error
+// BlockTestService is used for fetching blocklisted tests
+type BlockTestService interface {
+	GetBlockTests(ctx context.Context, tasConfig *TASConfig, repo, branch string) error
 }
 
 // TestExecutionService services execution of tests
 type TestExecutionService interface {
 	// Run executes the test execution scripts.
-	Run(ctx context.Context, tasConfig *TASConfig, payload *Payload, coverageDirectory string, secretMap map[string]string) (*ExecutionResult, error)
+	Run(ctx context.Context, tasConfig *TASConfig, payload *Payload, coverageDirectory string, secretMap map[string]string) (*ExecutionResults, error)
 }
 
 // CoverageService services coverage of tests
@@ -54,14 +52,15 @@ type CoverageService interface {
 	MergeAndUpload(ctx context.Context, payload *Payload) error
 }
 
-// YMLParserService services parsing of tas.yml
+// YMLParserService parses the .tas.yml files
 type YMLParserService interface {
-	PerformParsing(payload *Payload) error
+	// ParseAndValidate the YML file and validades it
+	ParseAndValidate(ctx context.Context, payload *Payload) error
 }
 
 // TestStats is used for servicing stat collection
 type TestStats interface {
-	CaptureTestStats(pid int32) error
+	CaptureTestStats(pid int32, collectStats bool) error
 }
 
 // Task is a service to update task status at neuron
@@ -100,6 +99,10 @@ type CacheStore interface {
 	Download(ctx context.Context, cacheKey string) error
 	// Upload creates, compresses and uploads cache at cacheKey
 	Upload(ctx context.Context, cacheKey string, itemsToCompress ...string) error
+	// CacheWorkspace caches the workspace onto a mounted volume
+	CacheWorkspace(ctx context.Context) error
+	// ExtractWorkspace extracts the workspace cache from mounted volume
+	ExtractWorkspace(ctx context.Context) error
 }
 
 // SecretParser defines operation for parsing the vault secrets in given path

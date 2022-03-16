@@ -28,9 +28,9 @@ WORKDIR /tmp/custom-runners
 RUN npm init -y
 
 RUN npm i --global-style --legacy-peer-deps \
-    @lambdatest/test-at-scale-jasmine-runner@~0.0.1 \
-    @lambdatest/test-at-scale-mocha-runner@~0.0.1 \
-    @lambdatest/test-at-scale-jest-runner@~0.0.1
+    @lambdatest/test-at-scale-jasmine-runner@~0.1.0 \
+    @lambdatest/test-at-scale-mocha-runner@~0.1.0 \
+    @lambdatest/test-at-scale-jest-runner@~0.1.0
 RUN npm i -g nyc@^15.1.0
 
 RUN tar -zcf /custom-runners/custom-runners.tgz node_modules
@@ -43,12 +43,7 @@ RUN su - nucleus -c "curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39
 
 WORKDIR /home/nucleus
 # copy the binary from builder
-COPY --chown=nucleus:nucleus --from=builder /nucleus/nucleus .
-COPY --chown=nucleus:nucleus sample-tas.yaml .
-COPY --chown=nucleus:nucleus scripts/ /scripts
-RUN cd /scripts && npm i
-RUN touch .nucleus.yml
-
+COPY --chown=nucleus:nucleus --from=builder /nucleus/nucleus /usr/local/bin/
 # run the binary
 COPY ./build/nucleus/entrypoint.sh /
 ENTRYPOINT  ["/bin/sh", "/entrypoint.sh"]
