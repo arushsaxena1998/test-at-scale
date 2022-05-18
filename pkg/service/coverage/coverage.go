@@ -16,13 +16,13 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/LambdaTest/synapse/config"
-	"github.com/LambdaTest/synapse/pkg/core"
-	"github.com/LambdaTest/synapse/pkg/global"
+	"github.com/LambdaTest/test-at-scale/config"
+	"github.com/LambdaTest/test-at-scale/pkg/core"
+	"github.com/LambdaTest/test-at-scale/pkg/global"
 	"golang.org/x/sync/errgroup"
 
-	"github.com/LambdaTest/synapse/pkg/fileutils"
-	"github.com/LambdaTest/synapse/pkg/lumber"
+	"github.com/LambdaTest/test-at-scale/pkg/fileutils"
+	"github.com/LambdaTest/test-at-scale/pkg/lumber"
 )
 
 const (
@@ -91,13 +91,13 @@ func (c *codeCoverageService) mergeCodeCoverageFiles(ctx context.Context, commit
 		return errors.New("no coverage dirs found")
 	}
 
-	args := []string{"/scripts/node_modules/.bin/babel-node", coverageFilePath,
-		"--commitDir", commitDir,
-		"--coverageFiles", "'" + strings.Join(coverageFiles, " ") + "'"}
+	command := fmt.Sprintf("/scripts/node_modules/.bin/babel-node %s --commitDir %s --coverageFiles '%s'",
+		coverageFilePath, commitDir, strings.Join(coverageFiles, " "))
 	if threshold {
-		args = append(args, "--coverageManifest", coverageManifestPath)
+		command = fmt.Sprintf("%s --coverageManifest %s", command, coverageManifestPath)
 	}
-	return c.execManager.ExecuteInternalCommands(ctx, core.CoverageMerge, args, "", nil, nil)
+	commands := []string{command}
+	return c.execManager.ExecuteInternalCommands(ctx, core.CoverageMerge, commands, "", nil, nil)
 }
 
 // MergeAndUpload compress the file and upload in azure blob

@@ -13,14 +13,14 @@ import (
 	"sync"
 	"time"
 
-	"github.com/LambdaTest/synapse/config"
-	"github.com/LambdaTest/synapse/pkg/global"
-	"github.com/LambdaTest/synapse/pkg/lumber"
-	"github.com/LambdaTest/synapse/pkg/proxyserver"
-	"github.com/LambdaTest/synapse/pkg/runner/docker"
-	"github.com/LambdaTest/synapse/pkg/secrets"
-	"github.com/LambdaTest/synapse/pkg/synapse"
-	"github.com/LambdaTest/synapse/pkg/utils"
+	"github.com/LambdaTest/test-at-scale/config"
+	"github.com/LambdaTest/test-at-scale/pkg/global"
+	"github.com/LambdaTest/test-at-scale/pkg/lumber"
+	"github.com/LambdaTest/test-at-scale/pkg/proxyserver"
+	"github.com/LambdaTest/test-at-scale/pkg/runner/docker"
+	"github.com/LambdaTest/test-at-scale/pkg/secrets"
+	"github.com/LambdaTest/test-at-scale/pkg/synapse"
+	"github.com/LambdaTest/test-at-scale/pkg/utils"
 	"github.com/joho/godotenv"
 	"github.com/spf13/cobra"
 )
@@ -95,8 +95,11 @@ func run(cmd *cobra.Command, args []string) {
 		logger.Fatalf("Could not instantiate proxyhandler %v", err)
 	}
 
+	// All attempts to connect to lambdatest server failed
+	connectionFailed := make(chan struct{})
+
 	wg.Add(1)
-	go synapse.InitiateConnection(ctx, &wg)
+	go synapse.InitiateConnection(ctx, &wg, connectionFailed)
 
 	wg.Add(1)
 	go func() {
@@ -138,6 +141,21 @@ func run(cmd *cobra.Command, args []string) {
 			case <-time.After(global.GracefulTimeout):
 				logger.Errorf("Graceful timeout exceeded. Brutally killing the application")
 			}
+		}
+
+	case <-connectionFailed:
+		{
+			logger.Debugf("main: all attempts to connect to lamdatest server failed ....")
+			// tell the goroutines to stop
+			logger.Debugf("main: telling goroutines to stop")
+			cancel()
+			select {
+			case <-done:
+				logger.Debugf("Go routines exited within timeout")
+			case <-time.After(global.GracefulTimeout):
+				logger.Errorf("Graceful timeout exceeded. Brutally killing the application")
+			}
+			os.Exit(0)
 
 		}
 	case <-done:

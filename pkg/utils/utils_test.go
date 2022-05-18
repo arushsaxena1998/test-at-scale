@@ -1,11 +1,17 @@
 package utils
 
 import (
+	"context"
 	"fmt"
 	"io/ioutil"
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/LambdaTest/test-at-scale/pkg/core"
+	"github.com/LambdaTest/test-at-scale/pkg/errs"
+	"github.com/LambdaTest/test-at-scale/testutils"
+	"github.com/stretchr/testify/assert"
 )
 
 func removeCreatedFile(path string) {
@@ -134,6 +140,90 @@ func TestGetOutboundIP(t *testing.T) {
 			if got := GetOutboundIP(); got != tt.want {
 				t.Errorf("GetOutboundIP() = %v, want %v", got, tt.want)
 			}
+		})
+	}
+}
+
+func TestValidateStruct(t *testing.T) {
+	ctx := context.TODO()
+	tests := []struct {
+		name     string
+		filename string
+		wantErr  error
+		want     *core.TASConfig
+	}{
+		{
+			"Junk characters File",
+			"testutils/testdata/tasyml/junk.yml",
+			// nolint:lll
+			fmt.Errorf("`testutils/testdata/tasyml/junk.yml` configuration file contains invalid format. Please correct the `testutils/testdata/tasyml/junk.yml` file"),
+			nil,
+		},
+		{
+			"Invalid Types",
+			"testutils/testdata/tasyml/invalid_types.yml",
+			// nolint:lll
+			fmt.Errorf("`testutils/testdata/tasyml/invalid_types.yml` configuration file contains invalid format. Please correct the `testutils/testdata/tasyml/invalid_types.yml` file"),
+			nil,
+		},
+		{
+			"Invalid Field Values",
+			"testutils/testdata/tasyml/invalid_fields.yml",
+			errs.ErrInvalidConf{
+				// nolint:lll
+				Message: "Invalid values provided for the following fields in the `testutils/testdata/tasyml/invalid_fields.yml` configuration file: \n",
+				Fields:  []string{"framework", "nodeVersion"},
+				Values:  []interface{}{"hello", "test"}},
+			nil,
+		},
+		{
+			"Valid Config",
+			"testutils/testdata/tasyml/valid.yml",
+			nil,
+			&core.TASConfig{
+				SmartRun:  true,
+				Framework: "jest",
+				Postmerge: &core.Merge{
+					EnvMap:   map[string]string{"NODE_ENV": "development"},
+					Patterns: []string{"{packages,scripts}/**/__tests__/*{.js,.coffee,[!d].ts}"},
+				},
+				Premerge: &core.Merge{
+					EnvMap:   map[string]string{"NODE_ENV": "development"},
+					Patterns: []string{"{packages,scripts}/**/__tests__/*{.js,.coffee,[!d].ts}"},
+				},
+				Prerun:      &core.Run{EnvMap: map[string]string{"NODE_ENV": "development"}, Commands: []string{"yarn"}},
+				Postrun:     &core.Run{Commands: []string{"node --version"}},
+				ConfigFile:  "scripts/jest/config.source-www.js",
+				NodeVersion: "14.17.6",
+				Tier:        "small",
+				SplitMode:   core.TestSplit,
+			},
+		},
+		{
+			"Valid Config - Only Framework",
+			"testutils/testdata/tasyml/framework_only_required.yml",
+			nil,
+			&core.TASConfig{
+				SmartRun:  true,
+				Framework: "mocha",
+				Tier:      "small",
+				SplitMode: core.TestSplit,
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ymlContent, err := testutils.LoadFile(tt.filename)
+			if err != nil {
+				t.Errorf("Error loading testfile %s", tt.filename)
+				return
+			}
+			tasConfig, errV := ValidateStruct(ctx, ymlContent, tt.filename)
+			if errV != nil {
+				assert.Equal(t, errV.Error(), tt.wantErr.Error(), "Error mismatch")
+				return
+			}
+			assert.Equal(t, tt.want, tasConfig, "Struct mismatch")
 		})
 	}
 }
