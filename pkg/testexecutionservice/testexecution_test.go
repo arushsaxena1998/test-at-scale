@@ -10,13 +10,14 @@ import (
 	"testing"
 
 	"github.com/LambdaTest/test-at-scale/config"
+	"github.com/LambdaTest/test-at-scale/mocks"
 	"github.com/LambdaTest/test-at-scale/pkg/core"
 	"github.com/LambdaTest/test-at-scale/pkg/global"
 	"github.com/LambdaTest/test-at-scale/pkg/lumber"
 	"github.com/LambdaTest/test-at-scale/pkg/requestutils"
 	"github.com/LambdaTest/test-at-scale/pkg/service/teststats"
 	"github.com/LambdaTest/test-at-scale/testutils"
-	"github.com/LambdaTest/test-at-scale/testutils/mocks"
+	"github.com/cenkalti/backoff/v4"
 	"github.com/stretchr/testify/mock"
 )
 
@@ -33,7 +34,7 @@ func TestNewTestExecutionService(t *testing.T) {
 	var ts *teststats.ProcStats
 	azureClient := new(mocks.AzureClient)
 	execManager := new(mocks.ExecutionManager)
-	requests := requestutils.New(logger)
+	requests := requestutils.New(logger, global.DefaultAPITimeout, &backoff.StopBackOff{})
 
 	type args struct {
 		execManager core.ExecutionManager
@@ -68,8 +69,15 @@ func Test_testExecutionService_GetLocatorsFile(t *testing.T) {
 	var ts *teststats.ProcStats
 	azureClient := new(mocks.AzureClient)
 	execManager := new(mocks.ExecutionManager)
-	azureClient.On("GetSASURL", mock.AnythingOfType("*context.emptyCtx"), mock.AnythingOfType("string"), mock.AnythingOfType("core.ContainerType")).Return("sasURL", nil)
-	azureClient.On("FindUsingSASUrl", mock.AnythingOfType("*context.emptyCtx"), mock.AnythingOfType("string")).Return(io.NopCloser(strings.NewReader("Hello, world!")), nil)
+	azureClient.On("GetSASURL",
+		mock.AnythingOfType("*context.emptyCtx"),
+		mock.AnythingOfType("string"),
+		mock.AnythingOfType("core.ContainerType"),
+	).Return("sasURL", nil)
+	azureClient.On("FindUsingSASUrl",
+		mock.AnythingOfType("*context.emptyCtx"),
+		mock.AnythingOfType("string"),
+	).Return(io.NopCloser(strings.NewReader("Hello, world!")), nil)
 
 	type fields struct {
 		logger      lumber.Logger

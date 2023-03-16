@@ -10,10 +10,10 @@ import (
 	"github.com/LambdaTest/test-at-scale/pkg/core"
 	"github.com/LambdaTest/test-at-scale/pkg/global"
 	"github.com/LambdaTest/test-at-scale/pkg/lumber"
-	"github.com/LambdaTest/test-at-scale/pkg/utils"
+	"github.com/LambdaTest/test-at-scale/pkg/tasconfigdownloader"
+	"github.com/cenkalti/backoff/v4"
 	"github.com/denisbrodbeck/machineid"
 	"github.com/gorilla/websocket"
-	"github.com/lestrrat-go/backoff"
 	"github.com/spf13/viper"
 )
 
@@ -29,6 +29,8 @@ const (
 	duplicateConnectionSleepDuration = 15 * time.Second
 )
 
+var buildAbortMap = make(map[string]bool)
+
 type synapse struct {
 	conn                     *websocket.Conn
 	runner                   core.DockerRunner
@@ -39,6 +41,7 @@ type synapse struct {
 	ConnectionAborted        chan struct{}
 	InvalidConnectionRequest chan struct{}
 	LogoutRequired           bool
+	tasConfigDownloader      *tasconfigdownloader.TASConfigDownloader
 }
 
 // New returns new instance of synapse
@@ -46,8 +49,8 @@ func New(
 	runner core.DockerRunner,
 	logger lumber.Logger,
 	secretsManager core.SecretsManager,
+	tasConfigDownloader *tasconfigdownloader.TASConfigDownloader,
 ) core.SynapseManager {
-
 	return &synapse{
 		runner:                   runner,
 		logger:                   logger,
@@ -57,6 +60,7 @@ func New(
 		MsgChan:                  make(chan []byte, 1024),
 		ConnectionAborted:        make(chan struct{}, 10),
 		LogoutRequired:           true,
+		tasConfigDownloader:      tasConfigDownloader,
 	}
 }
 
@@ -80,41 +84,39 @@ exponential backoff factor
 */
 func (s *synapse) openAndMaintainConnection(ctx context.Context, connectionFailed chan struct{}) {
 	// setup exponential backoff for retrying control websocket connection
-	var policy = backoff.NewExponential(
-		backoff.WithInterval(500*time.Millisecond),           // base interval
-		backoff.WithJitterFactor(0.05),                       // 5% jitter
-		backoff.WithMaxRetries(global.MaxConnectionAttempts), // If not specified, default number of retries is 10
-	)
-
-	b, cancel := policy.Start(context.Background())
-	defer cancel()
+	exponentialBackoff := backoff.NewExponentialBackOff()
+	exponentialBackoff.InitialInterval = 500 * time.Millisecond
+	exponentialBackoff.RandomizationFactor = 0.05
+	exponentialBackoff.MaxElapsedTime = 10 * time.Minute
 	s.logger.Debugf("starting socket connection at URL %s", global.SocketURL[viper.GetString("env")])
-	for backoff.Continue(b) {
-		s.logger.Debugf("trying to connect to lamdatest server")
+	operation := func() error {
+		s.logger.Debugf("trying to connect to TAS server")
 		select {
 		case <-ctx.Done():
-			return
+			return nil
 		default:
 			conn, _, err := websocket.DefaultDialer.Dial(global.SocketURL[viper.GetString("env")], nil)
 			if err != nil {
-				s.logger.Errorf("error connecting synapse to lambdatest %+v", err)
-				continue
+				s.logger.Errorf("error connecting synapse to TAS %+v", err)
+				return err
 			}
 			s.conn = conn
-			s.logger.Debugf("synapse connected to lambdatest server")
+			s.logger.Debugf("synapse connected to TAS server")
 			s.login()
 			if !s.connectionHandler(ctx, conn, connectionFailed) {
-				return
+				return nil
 			}
 			s.MsgErrChan = make(chan struct{})
+			// re-listen for any connection breaks
 			go s.openAndMaintainConnection(ctx, connectionFailed)
-			return
-
+			return nil
 		}
 	}
-	s.logger.Errorf("Unable to establish connection with lambdatest server. exiting...")
-	connectionFailed <- struct{}{}
-	s.LogoutRequired = false
+	if err := backoff.Retry(operation, exponentialBackoff); err != nil {
+		s.logger.Errorf("Unable to establish connection with lambdatest server. exiting...")
+		connectionFailed <- struct{}{}
+		s.LogoutRequired = false
+	}
 }
 
 /*
@@ -218,6 +220,12 @@ func (s *synapse) processMessage(msg []byte, duplicateConnectionChan chan struct
 	case core.MsgTask:
 		s.logger.Debugf("task message received from server")
 		go s.processTask(message)
+	case core.MsgYMLParsingRequest:
+		s.logger.Debugf("yml parsing request received from server")
+		go s.processYMLParsingRequest(message)
+	case core.MsgBuildAbort:
+		s.logger.Debugf("abort-build message received from server")
+		go s.processAbortBuild(message)
 	default:
 		s.logger.Errorf("message type not found")
 	}
@@ -235,6 +243,17 @@ func (s *synapse) processErrorMessage(message core.Message, duplicateConnectionC
 	}
 }
 
+// processAbortBuild handles aborting a running build
+func (s *synapse) processAbortBuild(message core.Message) {
+	buildID := string(message.Content)
+	buildAbortMap[buildID] = true
+	s.logger.Debugf("message received to abort build %s", buildID)
+	if err := s.runner.KillContainerForBuildID(buildID); err != nil {
+		s.logger.Errorf("error while terminating container for buildID: %s, error: %v", buildID, err)
+		return
+	}
+}
+
 // processTask handles task type message
 func (s *synapse) processTask(message core.Message) {
 	var runnerOpts core.RunnerOptions
@@ -245,7 +264,7 @@ func (s *synapse) processTask(message core.Message) {
 
 	// sending job started updates
 	if runnerOpts.PodType == core.NucleusPod {
-		jobInfo := CreateJobInfo(core.JobStarted, &runnerOpts)
+		jobInfo := CreateJobInfo(core.JobStarted, &runnerOpts, "")
 		s.logger.Infof("Sending update to neuron %+v", jobInfo)
 		resourceStatsMessage := CreateJobUpdateMessage(jobInfo)
 		s.writeMessageToBuffer(&resourceStatsMessage)
@@ -253,38 +272,30 @@ func (s *synapse) processTask(message core.Message) {
 	// mounting secrets to container
 	runnerOpts.HostVolumePath = fmt.Sprintf("/tmp/synapse/data/%s", runnerOpts.ContainerName)
 
-	if err := utils.CreateDirectory(runnerOpts.HostVolumePath); err != nil {
-		s.logger.Errorf("error creating file directory: %v", err)
-	}
-	if err := s.secretsManager.WriteGitSecrets(runnerOpts.HostVolumePath); err != nil {
-		s.logger.Errorf("error creating secrets %v", err)
-	}
-
-	if err := s.secretsManager.WriteRepoSecrets(runnerOpts.Label[Repo], runnerOpts.HostVolumePath); err != nil {
-		s.logger.Errorf("error creating repo secrets %v", err)
-	}
-	s.runAndUpdateJobStatus(runnerOpts)
-
+	s.runAndUpdateJobStatus(&runnerOpts)
 }
 
 // runAndUpdateJobStatus intiate and sends jobs status
-func (s *synapse) runAndUpdateJobStatus(runnerOpts core.RunnerOptions) {
+func (s *synapse) runAndUpdateJobStatus(runnerOpts *core.RunnerOptions) {
 	// starting container
 	statusChan := make(chan core.ContainerStatus)
 	defer close(statusChan)
 	s.logger.Debugf("starting container %s for build %s...", runnerOpts.ContainerName, runnerOpts.Label[BuildID])
-	go s.runner.Initiate(context.TODO(), &runnerOpts, statusChan)
+	go s.runner.Initiate(context.TODO(), runnerOpts, statusChan)
 
 	status := <-statusChan
 	// post job completion steps
 	s.logger.Debugf("jobID %s, buildID %s  status  %+v", runnerOpts.Label[JobID], runnerOpts.Label[BuildID], status)
 
-	s.sendResourceUpdates(core.ResourceRelease, &runnerOpts, runnerOpts.Label[JobID], runnerOpts.Label[BuildID])
+	s.sendResourceUpdates(core.ResourceRelease, runnerOpts, runnerOpts.Label[JobID], runnerOpts.Label[BuildID])
 	jobStatus := core.JobFailed
 	if status.Done {
 		jobStatus = core.JobCompleted
 	}
-	jobInfo := CreateJobInfo(jobStatus, &runnerOpts)
+	if buildAbortMap[runnerOpts.Label[BuildID]] {
+		jobStatus = core.JobAborted
+	}
+	jobInfo := CreateJobInfo(jobStatus, runnerOpts, status.Error.Message)
 	s.logger.Infof("Sending update to neuron %+v", jobInfo)
 	resourceStatsMessage := CreateJobUpdateMessage(jobInfo)
 	s.writeMessageToBuffer(&resourceStatsMessage)
@@ -299,11 +310,12 @@ func (s *synapse) login() {
 	}
 	lambdatestConfig := s.secretsManager.GetLambdatestSecrets()
 	loginDetails := core.LoginDetails{
-		Name:      s.secretsManager.GetSynapseName(),
-		SecretKey: lambdatestConfig.SecretKey,
-		CPU:       cpu,
-		RAM:       ram,
-		SynapseID: id,
+		Name:           s.secretsManager.GetSynapseName(),
+		SecretKey:      lambdatestConfig.SecretKey,
+		CPU:            cpu,
+		RAM:            ram,
+		SynapseID:      id,
+		SynapseVersion: global.SynapseBinaryVersion,
 	}
 	s.logger.Infof("Login synapse with id %s", loginDetails.SynapseID)
 
@@ -370,4 +382,41 @@ func (s *synapse) messageWriter(conn *websocket.Conn) {
 			}
 		}
 	}
+}
+
+func (s *synapse) processYMLParsingRequest(message core.Message) {
+	var parsingReqMsg *core.YMLParsingRequestMessage
+	var writeMsg core.Message
+	defer s.writeMessageToBuffer(&writeMsg)
+	if err := json.Unmarshal(message.Content, &parsingReqMsg); err != nil {
+		s.logger.Errorf("error in unmarshaling message for yml parsing request, error %v ", err)
+
+		writeMsg = createYMlParsingResultMessage(core.YMLParsingResultMessage{
+			OrgID:    parsingReqMsg.OrgID,
+			BuildID:  parsingReqMsg.BuildID,
+			ErrorMsg: err.Error(),
+		})
+		return
+	}
+	oauth := s.secretsManager.GetOauthToken()
+
+	tasOutput, err := s.tasConfigDownloader.GetTASConfig(context.TODO(), parsingReqMsg.GitProvider,
+		parsingReqMsg.CommitID,
+		parsingReqMsg.RepoSlug, parsingReqMsg.TasFileName, oauth,
+		parsingReqMsg.Event, parsingReqMsg.LicenseTier)
+	if err != nil {
+		s.logger.Errorf("error occurred while fetching tas config file for buildID %s orgID %s, error %v",
+			parsingReqMsg.BuildID, parsingReqMsg.OrgID, err)
+		writeMsg = createYMlParsingResultMessage(core.YMLParsingResultMessage{
+			OrgID:    parsingReqMsg.OrgID,
+			BuildID:  parsingReqMsg.BuildID,
+			ErrorMsg: err.Error(),
+		})
+		return
+	}
+	writeMsg = createYMlParsingResultMessage(core.YMLParsingResultMessage{
+		OrgID:     parsingReqMsg.OrgID,
+		BuildID:   parsingReqMsg.BuildID,
+		YMLOutput: *tasOutput,
+	})
 }

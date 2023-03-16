@@ -6,66 +6,22 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/LambdaTest/test-at-scale/config"
 	"github.com/LambdaTest/test-at-scale/pkg/core"
+	"github.com/LambdaTest/test-at-scale/pkg/global"
 	"github.com/LambdaTest/test-at-scale/pkg/lumber"
+	"github.com/LambdaTest/test-at-scale/pkg/requestutils"
 	"github.com/LambdaTest/test-at-scale/testutils"
+	"github.com/cenkalti/backoff/v4"
 )
 
-func TestNewTestBlockListService(t *testing.T) {
-	cfg := config.GlobalNucleusConfig
-	logger, err := testutils.GetLogger()
-	if err != nil {
-		t.Errorf("Couldn't initialise logger, error: %v", err)
-	}
+const buildID = "buildID"
 
-	want := TestBlockTestService{
-		cfg:               cfg,
-		logger:            logger,
-		endpoint:          "endpoint",
-		blockTestEntities: make(map[string][]blocktest),
-		errChan:           make(chan error, 1),
-		httpClient: http.Client{
-			Timeout: 15 * time.Second,
-			Transport: &http.Transport{
-				DisableKeepAlives: true,
-			},
-		}}
-	type args struct {
-		cfg    *config.NucleusConfig
-		logger lumber.Logger
-	}
-	tests := []struct {
-		name    string
-		args    args
-		want    *TestBlockTestService
-		wantErr bool
-	}{
-		{"Test NewTestBlockListService, it should give new TestBlockListService struct with provided arguments",
-			args{
-				cfg:    cfg,
-				logger: logger,
-			},
-			&want,
-			false,
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			_, err := NewTestBlockTestService(tt.args.cfg, tt.args.logger)
-			if (err != nil) != tt.wantErr {
-				t.Errorf("NewTestBlockListService() error = %v, wantErr %v", err, tt.wantErr)
-				return
-			}
-		})
-	}
-}
-
-func TestTestBlockListService_fetchBlockListFromNeuron(t *testing.T) {
+func TestBlockListService_fetchBlockListFromNeuron(t *testing.T) {
 	server := httptest.NewServer( // mock server
 		http.FileServer(http.Dir("../../testutils/testdata/testblocklistdata/")), // mock data stored at testutils/testdata
 	)
@@ -85,85 +41,50 @@ func TestTestBlockListService_fetchBlockListFromNeuron(t *testing.T) {
 	defer server2.Close()
 
 	cfg := new(config.NucleusConfig)
-	cfg.BuildID = "buildID"
+	cfg.BuildID = buildID
 	logger, err := testutils.GetLogger()
 	if err != nil {
-		t.Errorf("Couldn't initialise logger, error: %v", err)
-	}
-	httpClient := http.Client{
-		Timeout: 15 * time.Second,
-		Transport: &http.Transport{
-			DisableKeepAlives: true,
-		},
+		t.Errorf("Couldn't initialize logger, error: %v", err)
 	}
 	blocklistedEntities := make(map[string][]blocktest)
 
-	type fields struct {
-		cfg                 *config.NucleusConfig
-		logger              lumber.Logger
-		httpClient          http.Client
-		endpoint            string
-		blocklistedEntities map[string][]blocktest
-		errChan             chan error
-	}
 	type args struct {
-		ctx    context.Context
-		repoID string
-		branch string
+		ctx      context.Context
+		endpoint string
+		repoID   string
+		branch   string
 	}
 	tests := []struct {
 		name    string
-		fields  fields
 		args    args
 		wantErr bool
 	}{
 		{"Test fetchBlocklistFromNeuron",
-			fields{
-				cfg:                 cfg,
-				logger:              logger,
-				httpClient:          httpClient,
-				endpoint:            server.URL + "/testBlocklist.json",
-				blocklistedEntities: blocklistedEntities,
-				errChan:             make(chan error, 1),
-			},
 			args{
-				ctx:    context.TODO(),
-				repoID: "repoID",
-				branch: "branch",
+				ctx:      context.TODO(),
+				endpoint: server.URL + "/testBlocklist.json",
+				repoID:   "repoID",
+				branch:   "branch",
 			},
 			false,
 		},
 
 		{"Test fetchBlocklistFromNeuron for wrong request endpoint",
-			fields{
-				cfg:                 cfg,
-				logger:              logger,
-				httpClient:          httpClient,
-				endpoint:            "/dne.json",
-				blocklistedEntities: blocklistedEntities,
-				errChan:             make(chan error, 1),
-			},
 			args{
-				ctx:    context.TODO(),
-				repoID: "repoID",
-				branch: "branch",
+				ctx:      context.TODO(),
+				endpoint: "/dne.json",
+				repoID:   "repoID",
+				branch:   "branch",
 			},
 			true,
 		},
 
 		{"Test fetchBlocklistFromNeuron for non 200 response",
-			fields{
-				cfg:                 cfg,
-				logger:              logger,
-				httpClient:          httpClient,
-				endpoint:            server2.URL + "/non200",
-				blocklistedEntities: blocklistedEntities,
-				errChan:             make(chan error, 1),
-			},
 			args{
-				ctx:    context.TODO(),
-				repoID: "repoID",
-				branch: "branch",
+				ctx:      context.TODO(),
+				endpoint: server2.URL + "/non200",
+				repoID:   "repoID",
+				branch:   "branch",
 			},
 			true,
 		},
@@ -171,44 +92,41 @@ func TestTestBlockListService_fetchBlockListFromNeuron(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			tbs := &TestBlockTestService{
-				cfg:               tt.fields.cfg,
-				logger:            tt.fields.logger,
-				httpClient:        tt.fields.httpClient,
-				endpoint:          tt.fields.endpoint,
-				blockTestEntities: tt.fields.blocklistedEntities,
+				cfg:               cfg,
+				logger:            logger,
+				endpoint:          tt.args.endpoint,
+				blockTestEntities: blocklistedEntities,
 				once:              sync.Once{},
-				errChan:           tt.fields.errChan,
+				errChan:           make(chan error, 1),
+				requests:          requestutils.New(logger, global.DefaultAPITimeout, &backoff.StopBackOff{}),
 			}
-			if err := tbs.fetchBlockListFromNeuron(tt.args.ctx, tt.args.repoID, tt.args.branch); (err != nil) != tt.wantErr {
+			if err := tbs.fetchBlockListFromNeuron(tt.args.ctx, tt.args.branch); (err != nil) != tt.wantErr {
 				t.Errorf("TestBlockListService.fetchBlockListFromNeuron() error = %v, wantErr %v", err, tt.wantErr)
 			}
 		})
 	}
 }
 
-func TestTestBlockListService_GetBlockListedTests(t *testing.T) {
+func TestBlockListService_GetBlockListedTests(t *testing.T) {
 	server := httptest.NewServer( // mock server
 		http.FileServer(http.Dir("../../testutils/testdata/testblocklistdata/")), // mock data stored at testutils/testdata
 	)
 	defer server.Close()
 
 	cfg := new(config.NucleusConfig)
-	cfg.BuildID = "buildID"
+	cfg.BuildID = buildID
 	logger, err := testutils.GetLogger()
 	if err != nil {
-		t.Errorf("Couldn't initialise logger, error: %v", err)
+		t.Errorf("Couldn't initialize logger, error: %v", err)
 	}
-	tbs, err := NewTestBlockTestService(cfg, logger)
-	if err != nil {
-		t.Errorf("New TestBlockListService object couldn't be initialised, error: %v", err)
-	}
+	requests := requestutils.New(logger, global.DefaultAPITimeout, &backoff.StopBackOff{})
+	tbs := NewTestBlockTestService(cfg, requests, logger)
 
 	tbs.endpoint = server.URL + "/testBlocklist.json"
 
 	type args struct {
 		ctx       context.Context
 		tasConfig *core.TASConfig
-		repoID    string
 		branch    string
 	}
 	tests := []struct {
@@ -225,29 +143,24 @@ func TestTestBlockListService_GetBlockListedTests(t *testing.T) {
 					Blocklist: []string{"src/test/f1.spec.js", "src/test/f2.spec.js"},
 					SplitMode: core.TestSplit,
 					Tier:      "small"},
-				repoID: "/testBlocklist.json"},
-			true}, // Will not get error if the test is run in docker container, so test will fail in docker container
+			},
+			false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if err := tbs.GetBlockTests(tt.args.ctx, tt.args.tasConfig, tt.args.repoID, tt.args.branch); (err != nil) != tt.wantErr {
+			blYML := tt.args.tasConfig.Blocklist
+			if err := tbs.GetBlockTests(tt.args.ctx, blYML, tt.args.branch); (err != nil) != tt.wantErr {
 				t.Errorf("TestBlockListService.GetBlockListedTests() error = %v, wantErr %v", err, tt.wantErr)
 			}
 		})
 	}
 }
 
-func TestTestBlockListService_populateBlockList(t *testing.T) {
+func TestBlockListService_populateBlockList(t *testing.T) {
 	cfg := config.GlobalNucleusConfig
 	logger, err := testutils.GetLogger()
 	if err != nil {
-		t.Errorf("Couldn't initialise logger, error: %v", err)
-	}
-	httpClient := http.Client{
-		Timeout: 15 * time.Second,
-		Transport: &http.Transport{
-			DisableKeepAlives: true,
-		},
+		t.Errorf("Couldn't initialize logger, error: %v", err)
 	}
 	blocklistLocators := []*blocktestLocator{}
 	firstLocator := &blocktestLocator{
@@ -264,7 +177,6 @@ func TestTestBlockListService_populateBlockList(t *testing.T) {
 	type fields struct {
 		cfg                 *config.NucleusConfig
 		logger              lumber.Logger
-		httpClient          http.Client
 		endpoint            string
 		blocklistedEntities map[string][]blocktest
 		errChan             chan error
@@ -280,10 +192,9 @@ func TestTestBlockListService_populateBlockList(t *testing.T) {
 	}{
 		{"Test populateBlockList",
 			fields{
-				cfg:        cfg,
-				logger:     logger,
-				httpClient: httpClient,
-				endpoint:   "/blocktest",
+				cfg:      cfg,
+				logger:   logger,
+				endpoint: "/blocktest",
 				blocklistedEntities: map[string][]blocktest{
 					"src/test/api1.js": {
 						blocktest{
@@ -293,7 +204,6 @@ func TestTestBlockListService_populateBlockList(t *testing.T) {
 						},
 					},
 				},
-				// once:    sync.Once{},
 				errChan: make(chan error, 1)},
 			args{
 				blocklistSource:   "./",
@@ -306,17 +216,16 @@ func TestTestBlockListService_populateBlockList(t *testing.T) {
 			tbs := &TestBlockTestService{
 				cfg:               tt.fields.cfg,
 				logger:            tt.fields.logger,
-				httpClient:        tt.fields.httpClient,
 				endpoint:          tt.fields.endpoint,
 				blockTestEntities: tt.fields.blocklistedEntities,
 				once:              sync.Once{},
 				errChan:           tt.fields.errChan,
 			}
 			tbs.populateBlockList(tt.args.blocklistSource, tt.args.blocktestLocators)
-
-			expected := "map[src/test/api1.js:[{Source:src Locator:loc Status:blocklisted} {Source:./ Locator:src/test/api1.js## Status:quarantined}] src/test/api2.js:[{Source:./ Locator:src/test/api2.js## Status:blocklisted}]]"
-			got := fmt.Sprintf("%+v", tbs.blockTestEntities)
-			if expected != got {
+			expected := map[string][]blocktest{"src/test/api1.js": {{"src", "loc", "blocklisted"}, {"./", "src/test/api1.js##", "quarantined"}},
+				"src/test/api2.js": {{"./", "src/test/api2.js##", "blocklisted"}}}
+			got := tbs.blockTestEntities
+			if !reflect.DeepEqual(expected, got) {
 				t.Errorf("\nexpected: %v\ngot: %v", expected, got)
 			}
 		})

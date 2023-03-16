@@ -8,6 +8,7 @@ import (
 	"github.com/LambdaTest/test-at-scale/pkg/core"
 	"github.com/LambdaTest/test-at-scale/pkg/global"
 	"github.com/LambdaTest/test-at-scale/pkg/lumber"
+	"github.com/LambdaTest/test-at-scale/pkg/utils"
 )
 
 // task represents each instance of nucleus spawned by neuron
@@ -33,8 +34,8 @@ func (t *task) UpdateStatus(ctx context.Context, payload *core.TaskPayload) erro
 		t.logger.Errorf("error while json marshal %v", err)
 		return err
 	}
-
-	if _, err := t.requests.MakeAPIRequest(ctx, http.MethodPut, t.endpoint, reqBody); err != nil {
+	query, headers := utils.GetDefaultQueryAndHeaders()
+	if _, _, err := t.requests.MakeAPIRequest(ctx, http.MethodPut, t.endpoint, reqBody, query, headers); err != nil {
 		return err
 	}
 

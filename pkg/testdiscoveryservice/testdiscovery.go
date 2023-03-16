@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"os/exec"
+	"strings"
 
 	"github.com/LambdaTest/test-at-scale/pkg/core"
 	"github.com/LambdaTest/test-at-scale/pkg/global"
@@ -15,11 +16,11 @@ import (
 )
 
 type testDiscoveryService struct {
-	logger      lumber.Logger
-	execManager core.ExecutionManager
-	tdResChan   chan core.DiscoveryResult
-	requests    core.Requests
-	endpoint    string
+	logger            lumber.Logger
+	execManager       core.ExecutionManager
+	tdResChan         chan core.DiscoveryResult
+	requests          core.Requests
+	discoveryEndpoint string
 }
 
 // NewTestDiscoveryService creates and returns a new testDiscoveryService instance
@@ -29,106 +30,87 @@ func NewTestDiscoveryService(ctx context.Context,
 	requests core.Requests,
 	logger lumber.Logger) core.TestDiscoveryService {
 	return &testDiscoveryService{
-		logger:      logger,
-		execManager: execManager,
-		tdResChan:   tdResChan,
-		requests:    requests,
-		endpoint:    global.NeuronHost + "/test-list",
+		logger:            logger,
+		execManager:       execManager,
+		tdResChan:         tdResChan,
+		requests:          requests,
+		discoveryEndpoint: global.NeuronHost + "/test-list",
 	}
 }
 
-func (tds *testDiscoveryService) Discover(ctx context.Context,
-	tasConfig *core.TASConfig,
-	payload *core.Payload,
-	secretData map[string]string,
-	diff map[string]int,
-	diffExists bool) error {
-	var target []string
-	var envMap map[string]string
-	if payload.EventType == core.EventPullRequest {
-		target = tasConfig.Premerge.Patterns
-		envMap = tasConfig.Premerge.EnvMap
-	} else {
-		target = tasConfig.Postmerge.Patterns
-		envMap = tasConfig.Postmerge.EnvMap
-	}
-	tasYmlModified := false
-	configFilePath, err := utils.GetConfigFileName(payload.TasFileName)
+func (tds *testDiscoveryService) Discover(ctx context.Context, discoveryArgs *core.DiscoveyArgs) (*core.DiscoveryResult, error) {
+	configFilePath, err := utils.GetConfigFileName(discoveryArgs.Payload.TasFileName)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	if _, ok := diff[configFilePath]; ok {
-		tasYmlModified = true
-	}
+	impactAll := tds.shouldImpactAll(discoveryArgs.SmartRun, configFilePath, discoveryArgs.Diff)
 
-	// discover all tests if tas.yml modified or smart run feature is set to false
-	discoverAll := tasYmlModified || !tasConfig.SmartRun
+	args := utils.GetArgs("discover", discoveryArgs.FrameWork, discoveryArgs.FrameWorkVersion,
+		discoveryArgs.TestConfigFile, discoveryArgs.TestPattern)
 
-	args := []string{"--command", "discover"}
-	if !discoverAll {
-		if len(diff) == 0 && diffExists {
+	if !impactAll {
+		if len(discoveryArgs.Diff) == 0 && discoveryArgs.DiffExists {
 			// empty diff; in PR, a commit added and then reverted to cause an overall empty PR diff
-			args = append(args, "--diff")
+			args = append(args, global.ArgDiff)
 		} else {
-			for k, v := range diff {
+			for k, v := range discoveryArgs.Diff {
 				// in changed files we only have added or modified files.
 				if v != core.FileRemoved {
-					args = append(args, "--diff", k)
+					args = append(args, global.ArgDiff, k)
 				}
 			}
 		}
 	}
-	if tasConfig.ConfigFile != "" {
-		args = append(args, "--config", tasConfig.ConfigFile)
-	}
+	tds.logger.Debugf("Discovering tests at paths %+v", discoveryArgs.TestPattern)
 
-	for _, pattern := range target {
-		args = append(args, "--pattern", pattern)
-	}
-	tds.logger.Debugf("Discovering tests at paths %+v", target)
-
-	cmd := exec.CommandContext(ctx, global.FrameworkRunnerMap[tasConfig.Framework], args...)
-	cmd.Dir = global.RepoDir
-	envVars, err := tds.execManager.GetEnvVariables(envMap, secretData)
+	cmd := exec.CommandContext(ctx, global.FrameworkRunnerMap[discoveryArgs.FrameWork], args...) //nolint:gosec
+	cmd.Dir = discoveryArgs.CWD
+	envVars, err := tds.execManager.GetEnvVariables(discoveryArgs.EnvMap, discoveryArgs.SecretData)
 	if err != nil {
 		tds.logger.Errorf("failed to parse env variables, error: %v", err)
-		return err
+		return nil, err
 	}
 	cmd.Env = envVars
 	logWriter := lumber.NewWriter(tds.logger)
 	defer logWriter.Close()
-	maskWriter := logstream.NewMasker(logWriter, secretData)
+	maskWriter := logstream.NewMasker(logWriter, discoveryArgs.SecretData)
 	cmd.Stdout = maskWriter
 	cmd.Stderr = maskWriter
 
 	tds.logger.Debugf("Executing test discovery command: %s", cmd.String())
 	if err := cmd.Run(); err != nil {
 		tds.logger.Errorf("command %s of type %s failed with error: %v", cmd.String(), core.Discovery, err)
-		return err
+		return nil, err
 	}
 
 	testDiscoveryResult := <-tds.tdResChan
-	testDiscoveryResult.Parallelism = tasConfig.Parallelism
-	testDiscoveryResult.SplitMode = tasConfig.SplitMode
-	testDiscoveryResult.ContainerImage = tasConfig.ContainerImage
-	testDiscoveryResult.Tier = tasConfig.Tier
-	if err := tds.updateResult(ctx, &testDiscoveryResult); err != nil {
-		return err
-	}
-	return nil
+	return &testDiscoveryResult, nil
 }
 
-func (tds *testDiscoveryService) updateResult(ctx context.Context, testDiscoveryResult *core.DiscoveryResult) error {
+func (tds *testDiscoveryService) shouldImpactAll(smartRun bool, configFilePath string, diff map[string]int) bool {
+	impactAll := !smartRun
+	if _, ok := diff[configFilePath]; ok {
+		impactAll = true
+	}
+	for diffFile := range diff {
+		if strings.HasSuffix(diffFile, global.PackageJSON) {
+			impactAll = true
+			break
+		}
+	}
+	return impactAll
+}
+
+func (tds *testDiscoveryService) SendResult(ctx context.Context, testDiscoveryResult *core.DiscoveryResult) error {
 	reqBody, err := json.Marshal(testDiscoveryResult)
 	if err != nil {
 		tds.logger.Errorf("error while json marshal %v", err)
 		return err
 	}
-
-	if _, err := tds.requests.MakeAPIRequest(ctx, http.MethodPost, tds.endpoint, reqBody); err != nil {
+	query, headers := utils.GetDefaultQueryAndHeaders()
+	if _, _, err := tds.requests.MakeAPIRequest(ctx, http.MethodPost, tds.discoveryEndpoint, reqBody, query, headers); err != nil {
 		return err
 	}
 
 	return nil
-
 }

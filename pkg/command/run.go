@@ -9,7 +9,6 @@ import (
 	"strings"
 
 	"github.com/LambdaTest/test-at-scale/pkg/core"
-	"github.com/LambdaTest/test-at-scale/pkg/global"
 	"github.com/LambdaTest/test-at-scale/pkg/logstream"
 	"github.com/LambdaTest/test-at-scale/pkg/lumber"
 )
@@ -34,7 +33,9 @@ func (m *manager) ExecuteUserCommands(ctx context.Context,
 	commandType core.CommandType,
 	payload *core.Payload,
 	runConfig *core.Run,
-	secretData map[string]string) error {
+	secretData map[string]string,
+	logwriter core.LogWriterStrategy,
+	cwd string) error {
 	script, err := m.createScript(runConfig.Commands, secretData)
 	if err != nil {
 		return err
@@ -43,20 +44,18 @@ func (m *manager) ExecuteUserCommands(ctx context.Context,
 	if err != nil {
 		return err
 	}
-
 	azureReader, azureWriter := io.Pipe()
 	defer azureWriter.Close()
 
-	blobPath := fmt.Sprintf("%s/%s/%s/%s.log", payload.OrgID, payload.BuildID, os.Getenv("TASK_ID"), commandType)
-	errChan := m.StoreCommandLogs(ctx, blobPath, azureReader)
-
+	errChan := logwriter.Write(ctx, azureReader)
+	defer m.closeAndWriteLog(azureWriter, errChan, commandType)
 	logWriter := lumber.NewWriter(m.logger)
 	defer logWriter.Close()
 	multiWriter := io.MultiWriter(logWriter, azureWriter)
 	maskWriter := logstream.NewMasker(multiWriter, secretData)
 
 	cmd := exec.CommandContext(ctx, "/bin/bash", "-c", script)
-	cmd.Dir = global.RepoDir
+	cmd.Dir = cwd
 	cmd.Env = envVars
 	cmd.Stdout = maskWriter
 	cmd.Stderr = maskWriter
@@ -65,7 +64,6 @@ func (m *manager) ExecuteUserCommands(ctx context.Context,
 		m.logger.Errorf("failed to start command: %s, error: %v", commandType, startErr)
 		return startErr
 	}
-	m.logger.Debugf("command of type %s started with id %d", commandType, cmd.Process.Pid)
 	if execErr := cmd.Wait(); execErr != nil {
 		m.logger.Errorf("command %s, exited with error: %v", commandType, execErr)
 		return execErr
@@ -114,24 +112,9 @@ func (m *manager) GetEnvVariables(envMap, secretData map[string]string) ([]strin
 	return envVars, nil
 }
 
-// StoreCommandLogs stores the command logs to blob
-func (m *manager) StoreCommandLogs(ctx context.Context, blobPath string, reader io.Reader) <-chan error {
-	errChan := make(chan error, 1)
-	go func() {
-		sasURL, err := m.azureClient.GetSASURL(ctx, blobPath, core.LogsContainer)
-		if err != nil {
-			m.logger.Errorf("failed to genereate SAS URL for path %s, error: %v", blobPath, err)
-			errChan <- err
-			return
-		}
-		blobPath, err := m.azureClient.CreateUsingSASURL(ctx, sasURL, reader, "text/plain")
-		if err != nil {
-			m.logger.Errorf("failed to create SAS URL for path %s, error: %v", blobPath, err)
-			errChan <- err
-			return
-		}
-		close(errChan)
-		m.logger.Debugf("created blob path %s", blobPath)
-	}()
-	return errChan
+func (m *manager) closeAndWriteLog(azureWriter *io.PipeWriter, errChan <-chan error, commandType core.CommandType) {
+	azureWriter.Close()
+	if uploadErr := <-errChan; uploadErr != nil {
+		m.logger.Errorf("failed to upload logs for command %s, error: %v", commandType, uploadErr)
+	}
 }

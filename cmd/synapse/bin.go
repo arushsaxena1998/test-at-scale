@@ -14,12 +14,14 @@ import (
 	"time"
 
 	"github.com/LambdaTest/test-at-scale/config"
+	"github.com/LambdaTest/test-at-scale/pkg/cron"
 	"github.com/LambdaTest/test-at-scale/pkg/global"
 	"github.com/LambdaTest/test-at-scale/pkg/lumber"
 	"github.com/LambdaTest/test-at-scale/pkg/proxyserver"
 	"github.com/LambdaTest/test-at-scale/pkg/runner/docker"
 	"github.com/LambdaTest/test-at-scale/pkg/secrets"
-	"github.com/LambdaTest/test-at-scale/pkg/synapse"
+	synapsepkg "github.com/LambdaTest/test-at-scale/pkg/synapse"
+	"github.com/LambdaTest/test-at-scale/pkg/tasconfigdownloader"
 	"github.com/LambdaTest/test-at-scale/pkg/utils"
 	"github.com/joho/godotenv"
 	"github.com/spf13/cobra"
@@ -30,7 +32,7 @@ func RootCommand() *cobra.Command {
 	rootCmd := cobra.Command{
 		Use:     "synapse",
 		Long:    `Synapse is an opensource runner for TAS`,
-		Version: global.SYNAPSE_BINARY_VERSION,
+		Version: global.SynapseBinaryVersion,
 		Run:     run,
 	}
 
@@ -87,13 +89,17 @@ func run(cmd *cobra.Command, args []string) {
 	if err != nil {
 		logger.Fatalf("could not instantiate k8s runner %v", err)
 	}
-
-	synapse := synapse.New(runner, logger, secretsManager)
+	tasConfigDownloader := tasconfigdownloader.New(logger)
+	synapse := synapsepkg.New(runner, logger, secretsManager, tasConfigDownloader)
 
 	proxyHandler, err := proxyserver.NewProxyHandler(logger)
 	if err != nil {
 		logger.Fatalf("Could not instantiate proxyhandler %v", err)
 	}
+
+	// setting up cron handler
+	wg.Add(1)
+	go cron.Setup(ctx, &wg, logger, runner)
 
 	// All attempts to connect to lambdatest server failed
 	connectionFailed := make(chan struct{})

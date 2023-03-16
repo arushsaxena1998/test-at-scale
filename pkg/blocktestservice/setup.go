@@ -4,18 +4,16 @@ package blocktestservice
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"io/ioutil"
 	"net/http"
-	"net/url"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/LambdaTest/test-at-scale/config"
 	"github.com/LambdaTest/test-at-scale/pkg/core"
 	"github.com/LambdaTest/test-at-scale/pkg/global"
 	"github.com/LambdaTest/test-at-scale/pkg/lumber"
+	"github.com/LambdaTest/test-at-scale/pkg/utils"
 )
 
 const (
@@ -45,8 +43,8 @@ type blocktestLocator struct {
 // TestBlockTestService represents an instance of ConfManager instance
 type TestBlockTestService struct {
 	cfg               *config.NucleusConfig
+	requests          core.Requests
 	logger            lumber.Logger
-	httpClient        http.Client
 	endpoint          string
 	blockTestEntities map[string][]blocktest
 	once              sync.Once
@@ -54,65 +52,31 @@ type TestBlockTestService struct {
 }
 
 // NewTestBlockTestService creates and returns a new TestBlockTestService instance
-func NewTestBlockTestService(cfg *config.NucleusConfig, logger lumber.Logger) (*TestBlockTestService, error) {
-
+func NewTestBlockTestService(cfg *config.NucleusConfig, requests core.Requests, logger lumber.Logger) *TestBlockTestService {
 	return &TestBlockTestService{
 		cfg:               cfg,
 		logger:            logger,
+		requests:          requests,
 		endpoint:          global.NeuronHost + "/blocktest",
 		blockTestEntities: make(map[string][]blocktest),
 		errChan:           make(chan error, 1),
-		httpClient: http.Client{
-			Timeout: 15 * time.Second,
-			Transport: &http.Transport{
-				DisableKeepAlives: true,
-			},
-		}}, nil
+	}
 }
 
-func (tbs *TestBlockTestService) fetchBlockListFromNeuron(ctx context.Context, repoID, branch string) error {
+func (tbs *TestBlockTestService) fetchBlockListFromNeuron(ctx context.Context, branch string) error {
 	var inp []blocktestAPIResponse
-	u, err := url.Parse(tbs.endpoint)
-	if err != nil {
-		tbs.logger.Errorf("error while parsing endpoint %s, %v", tbs.endpoint, err)
-		return err
-	}
-	q := u.Query()
-	q.Set("repoID", repoID)
-	q.Set("branch", branch)
-	q.Set("taskID", tbs.cfg.TaskID)
-	u.RawQuery = q.Encode()
+	query, headers := utils.GetDefaultQueryAndHeaders()
+	query["branch"] = branch
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
-	if err != nil {
-		tbs.logger.Errorf("Unable to fetch blocklist response: %+v", err)
-		return err
-	}
-
-	resp, err := tbs.httpClient.Do(req)
-	if err != nil {
-		tbs.logger.Errorf("Unable to fetch blocklist response: %v", err)
-		return err
-	}
-
-	defer resp.Body.Close()
-
-	if resp.StatusCode == http.StatusNotFound {
+	rawBytes, statusCode, err := tbs.requests.MakeAPIRequest(ctx, http.MethodGet, tbs.endpoint, nil, query, headers)
+	if statusCode == http.StatusNotFound {
 		return nil
 	}
-	if resp.StatusCode != http.StatusOK {
-		err = errors.New("non 200 status")
-		tbs.logger.Errorf("Unable to fetch blocklist response: %v", err)
-		return err
-	}
-
-	body, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
-		tbs.logger.Errorf("Unable to fetch blocklist response: %v", err)
 		return err
 	}
 
-	if jsonErr := json.Unmarshal(body, &inp); jsonErr != nil {
+	if jsonErr := json.Unmarshal(rawBytes, &inp); jsonErr != nil {
 		tbs.logger.Errorf("Unable to fetch blocklist response: %v", jsonErr)
 		return jsonErr
 	}
@@ -130,12 +94,11 @@ func (tbs *TestBlockTestService) fetchBlockListFromNeuron(ctx context.Context, r
 }
 
 // GetBlockTests provides list of blocked test cases
-func (tbs *TestBlockTestService) GetBlockTests(ctx context.Context, tasConfig *core.TASConfig, repoID, branch string) error {
-
+func (tbs *TestBlockTestService) GetBlockTests(ctx context.Context, blocklistYAML []string, branch string) error {
 	tbs.once.Do(func() {
 
-		blocktestLocators := make([]*blocktestLocator, 0, len(tasConfig.Blocklist))
-		for _, locator := range tasConfig.Blocklist {
+		blocktestLocators := make([]*blocktestLocator, 0, len(blocklistYAML))
+		for _, locator := range blocklistYAML {
 			blockLocator := new(blocktestLocator)
 			blockLocator.Locator = locator
 			blockLocator.Status = string(core.Blocklisted)
@@ -144,7 +107,7 @@ func (tbs *TestBlockTestService) GetBlockTests(ctx context.Context, tasConfig *c
 
 		tbs.populateBlockList("yml", blocktestLocators)
 
-		if err := tbs.fetchBlockListFromNeuron(ctx, repoID, branch); err != nil {
+		if err := tbs.fetchBlockListFromNeuron(ctx, branch); err != nil {
 			tbs.logger.Errorf("Unable to fetch remote blocklist: %v. Ignoring remote response", err)
 			tbs.errChan <- err
 			return
@@ -175,20 +138,21 @@ func (tbs *TestBlockTestService) GetBlockTests(ctx context.Context, tasConfig *c
 }
 
 func (tbs *TestBlockTestService) populateBlockList(blocktestSource string, blocktestLocators []*blocktestLocator) {
-
 	i := 0
 	for _, test := range blocktestLocators {
-		//locators must end with delimiter
+		// locators must end with delimiter
 		if !strings.HasSuffix(test.Locator, delimiter) {
 			test.Locator += delimiter
 		}
 		i = strings.Index(test.Locator, delimiter)
-		//TODO: handle duplicate entries and ignore its individual suites or testcases in blocklist if file is blocklisted
+		// TODO: handle duplicate entries and ignore its individual suites or testcases in blocklist if file is blocklisted
 
+		entity := blocktest{Source: blocktestSource, Locator: test.Locator, Status: test.Status}
 		if val, ok := tbs.blockTestEntities[test.Locator[:i]]; ok {
-			tbs.blockTestEntities[test.Locator[:i]] = append(val, blocktest{Source: blocktestSource, Locator: test.Locator, Status: test.Status})
+			tbs.blockTestEntities[test.Locator[:i]] = append(val, entity)
 		} else {
-			tbs.blockTestEntities[test.Locator[:i]] = append([]blocktest{}, blocktest{Source: blocktestSource, Locator: test.Locator, Status: test.Status})
+			tbs.blockTestEntities[test.Locator[:i]] = append([]blocktest{},
+				blocktest{Source: blocktestSource, Locator: test.Locator, Status: test.Status})
 		}
 	}
 }

@@ -29,13 +29,14 @@ func CreateLogoutMessage() core.Message {
 }
 
 // CreateJobInfo creates jobInfo based on status and runner
-func CreateJobInfo(status core.StatusType, runnerOpts *core.RunnerOptions) core.JobInfo {
+func CreateJobInfo(status core.StatusType, runnerOpts *core.RunnerOptions, message string) core.JobInfo {
 	jobInfo := core.JobInfo{
 		Status:  status,
 		JobID:   runnerOpts.Label[JobID],
 		BuildID: runnerOpts.Label[BuildID],
 		ID:      runnerOpts.Label[ID],
 		Mode:    runnerOpts.Label[Mode],
+		Message: message,
 	}
 	return jobInfo
 }
@@ -73,4 +74,17 @@ func GetResources(tierOpts core.Tier) core.Specs {
 		return val
 	}
 	return core.Specs{CPU: 0, RAM: 0}
+}
+
+// createYMlParsingResultMessage creates message for YML parsing result
+func createYMlParsingResultMessage(ymlParsingOutput core.YMLParsingResultMessage) core.Message {
+	ymlParsingOutputJSON, err := json.Marshal(ymlParsingOutput)
+	if err != nil {
+		return core.Message{}
+	}
+	return core.Message{
+		Type:    core.MsgYMLParsingResult,
+		Content: ymlParsingOutputJSON,
+		Success: true,
+	}
 }

@@ -15,14 +15,23 @@ type PayloadManager interface {
 
 // TASConfigManager defines operations for tas config
 type TASConfigManager interface {
-	// LoadAndValidate loads and validates the TASConfig from the given path
-	LoadAndValidate(ctx context.Context, path string, eventType EventType, licenseTier Tier) (*TASConfig, error)
+	// LoadAndValidate loads and returns the tas config
+	LoadAndValidate(ctx context.Context, version int, path string, eventType EventType, licenseTier Tier,
+		tasFilePathInRepo string) (interface{}, error)
+
+	// GetVersion returns TAS yml version
+	GetVersion(path string) (int, error)
+
+	// GetTasConfigFilePath returns file path of tas config
+	GetTasConfigFilePath(payload *Payload) (string, error)
 }
 
 // GitManager manages the cloning of git repositories
 type GitManager interface {
 	// Clone repository from TAS config
 	Clone(ctx context.Context, payload *Payload, oauth *Oauth) error
+	// DownloadFileByCommit download file from repo for given commit
+	DownloadFileByCommit(ctx context.Context, gitProvider, repoSlug, commitID, filePath string, oauth *Oauth) (string, error)
 }
 
 // DiffManager manages the diff findings for the given payload
@@ -33,20 +42,21 @@ type DiffManager interface {
 // TestDiscoveryService services discovery of tests
 type TestDiscoveryService interface {
 	// Discover executes the test discovery scripts.
-	Discover(ctx context.Context, tasConfig *TASConfig,
-		payload *Payload, secretData map[string]string, diff map[string]int, diffExists bool) error
+	Discover(ctx context.Context, args *DiscoveyArgs) (*DiscoveryResult, error)
+
+	// SendResult sends discovery result to TAS server
+	SendResult(ctx context.Context, testDiscoveryResult *DiscoveryResult) error
 }
 
 // BlockTestService is used for fetching blocklisted tests
 type BlockTestService interface {
-	GetBlockTests(ctx context.Context, tasConfig *TASConfig, repo, branch string) error
+	GetBlockTests(ctx context.Context, blocklistYAML []string, branch string) error
 }
 
 // TestExecutionService services execution of tests
 type TestExecutionService interface {
-	// Run executes the test execution scripts.
-	Run(ctx context.Context, tasConfig *TASConfig,
-		payload *Payload, coverageDirectory string, secretMap map[string]string) (results *ExecutionResults, err error)
+	// Run executes the test execution scripts
+	Run(ctx context.Context, testExecutionArgs *TestExecutionArgs) (results *ExecutionResults, err error)
 	// SendResults sends the test execution results to the TAS server.
 	SendResults(ctx context.Context, payload *ExecutionResults) (resp *TestReportResponsePayload, err error)
 }
@@ -81,7 +91,7 @@ type AzureClient interface {
 	Find(ctx context.Context, path string) (io.ReadCloser, error)
 	Create(ctx context.Context, path string, reader io.Reader, mimeType string) (string, error)
 	CreateUsingSASURL(ctx context.Context, sasURL string, reader io.Reader, mimeType string) (string, error)
-	GetSASURL(ctx context.Context, containerPath string, containerType ContainerType) (string, error)
+	GetSASURL(ctx context.Context, purpose SASURLPurpose, query map[string]interface{}) (string, error)
 	Exists(ctx context.Context, path string) (bool, error)
 }
 
@@ -92,15 +102,16 @@ type ZstdCompressor interface {
 }
 
 // CacheStore defines operation for working with the cache
+//go:generate mockery  --name  CacheStore  --keeptree  --output  ../mocks/CacheStore.go
 type CacheStore interface {
 	// Download downloads cache present at cacheKey
 	Download(ctx context.Context, cacheKey string) error
 	// Upload creates, compresses and uploads cache at cacheKey
 	Upload(ctx context.Context, cacheKey string, itemsToCompress ...string) error
 	// CacheWorkspace caches the workspace onto a mounted volume
-	CacheWorkspace(ctx context.Context) error
+	CacheWorkspace(ctx context.Context, subModule string) error
 	// ExtractWorkspace extracts the workspace cache from mounted volume
-	ExtractWorkspace(ctx context.Context) error
+	ExtractWorkspace(ctx context.Context, subModule string) error
 }
 
 // SecretParser defines operation for parsing the vault secrets in given path
@@ -118,17 +129,55 @@ type SecretParser interface {
 // ExecutionManager has responsibility for executing the preRun, postRun and internal commands
 type ExecutionManager interface {
 	// ExecuteUserCommands executes the preRun or postRun commands given by user in his yaml.
-	ExecuteUserCommands(ctx context.Context, commandType CommandType, payload *Payload, runConfig *Run, secretData map[string]string) error
+	ExecuteUserCommands(ctx context.Context,
+		commandType CommandType,
+		payload *Payload,
+		runConfig *Run,
+		secretData map[string]string,
+		logwriter LogWriterStrategy,
+		cwd string) error
+
 	// ExecuteInternalCommands executes the commands like installing runners and test discovery.
-	ExecuteInternalCommands(ctx context.Context, commandType CommandType, commands []string, cwd string, envMap, secretData map[string]string) error
+	ExecuteInternalCommands(ctx context.Context,
+		commandType CommandType,
+		commands []string,
+		cwd string, envMap,
+		secretData map[string]string) error
 	// GetEnvVariables get the environment variables from the env map given by user.
 	GetEnvVariables(envMap, secretData map[string]string) ([]string, error)
-	// StoreCommandLogs stores the command logs in the azure.
-	StoreCommandLogs(ctx context.Context, blobPath string, reader io.Reader) <-chan error
 }
 
 // Requests is a util interface for making API Requests
 type Requests interface {
-	// MakeAPIRequest makes an HTTP request
-	MakeAPIRequest(ctx context.Context, httpMethod, endpoint string, body []byte) ([]byte, error)
+	// MakeAPIRequest makes an HTTP request with auth
+	MakeAPIRequest(ctx context.Context, httpMethod, endpoint string, body []byte, params map[string]interface{},
+		headers map[string]string) (rawbody []byte, statusCode int, err error)
+}
+
+// ListSubModuleService will sends the submodule count to TAS server
+type ListSubModuleService interface {
+	// Send sends count of submodules to TAS server
+	Send(ctx context.Context, buildID string, totalSubmodule int) error
+}
+
+// Driver has the responsibility to run discovery and test execution
+type Driver interface {
+	// RunDiscovery runs the test discovery
+	RunDiscovery(ctx context.Context, payload *Payload,
+		taskPayload *TaskPayload, oauth *Oauth, coverageDir string, secretMap map[string]string) error
+	// RunExecution runs the test execution
+	RunExecution(ctx context.Context, payload *Payload,
+		taskPayload *TaskPayload, oauth *Oauth, coverageDir string, secretMap map[string]string) error
+}
+
+// LogWriterStrategy interface is used to tag all log writing strategy
+type LogWriterStrategy interface {
+	// Write reads data from io.Reader and write it to various data stream
+	Write(ctx context.Context, reader io.Reader) <-chan error
+}
+
+// Builder builds the driver for given tas yml version
+type Builder interface {
+	// GetDriver returns driver for use
+	GetDriver(version int, ymlFilePath string) (Driver, error)
 }

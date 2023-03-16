@@ -4,12 +4,7 @@ package payloadmanager
 import (
 	"context"
 	"encoding/json"
-	"errors"
-	"fmt"
 	"net/http"
-	"net/url"
-	"strings"
-	"time"
 
 	"github.com/LambdaTest/test-at-scale/config"
 	"github.com/LambdaTest/test-at-scale/pkg/core"
@@ -20,60 +15,32 @@ import (
 // PayloadManager represents the payload for nucleus
 type payloadManager struct {
 	logger      lumber.Logger
-	httpClient  http.Client
 	azureClient core.AzureClient
 	cfg         *config.NucleusConfig
+	requests    core.Requests
 }
 
 // NewPayloadManger creates and returns a new PayloadManager instance
 func NewPayloadManger(azureClient core.AzureClient,
-	logger lumber.Logger, cfg *config.NucleusConfig) core.PayloadManager {
-	pm := payloadManager{
+	logger lumber.Logger, cfg *config.NucleusConfig, requests core.Requests) core.PayloadManager {
+	return &payloadManager{
 		azureClient: azureClient,
 		logger:      logger,
-		httpClient: http.Client{
-			Timeout: 30 * time.Second,
-		},
-		cfg: cfg,
+		cfg:         cfg,
+		requests:    requests,
 	}
-
-	return &pm
 }
 
 func (pm *payloadManager) FetchPayload(ctx context.Context, payloadAddress string) (*core.Payload, error) {
-	if payloadAddress == "" {
-		return nil, errors.New("invalid payload address")
-	}
-
-	u, err := url.Parse(payloadAddress)
+	rawBytes, _, err := pm.requests.MakeAPIRequest(ctx, http.MethodGet, payloadAddress, nil, nil, nil)
 	if err != nil {
 		return nil, err
 	}
-	// string the container name to get blob path
-	blobPath := strings.Replace(u.Path, fmt.Sprintf("/%s/", core.PayloadContainer), "", -1)
-
-	sasURL, err := pm.azureClient.GetSASURL(ctx, blobPath, core.PayloadContainer)
-	if err != nil {
+	p := new(core.Payload)
+	if err := json.Unmarshal(rawBytes, p); err != nil {
 		return nil, err
 	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, sasURL, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	r, err := pm.httpClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer r.Body.Close()
-	var p core.Payload
-	err = json.NewDecoder(r.Body).Decode(&p)
-	if err != nil {
-		return nil, err
-	}
-	return &p, nil
-
+	return p, nil
 }
 
 func (pm *payloadManager) ValidatePayload(ctx context.Context, payload *core.Payload) error {

@@ -5,14 +5,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 
 	"github.com/LambdaTest/test-at-scale/config"
 	"github.com/LambdaTest/test-at-scale/pkg/core"
@@ -20,6 +17,7 @@ import (
 	"github.com/LambdaTest/test-at-scale/pkg/logstream"
 	"github.com/LambdaTest/test-at-scale/pkg/lumber"
 	"github.com/LambdaTest/test-at-scale/pkg/service/teststats"
+	"github.com/LambdaTest/test-at-scale/pkg/utils"
 )
 
 const locatorFile = "locators"
@@ -52,51 +50,27 @@ func NewTestExecutionService(cfg *config.NucleusConfig,
 
 // Run executes the test files
 func (tes *testExecutionService) Run(ctx context.Context,
-	tasConfig *core.TASConfig,
-	payload *core.Payload,
-	coverageDir string,
-	secretData map[string]string) (*core.ExecutionResults, error) {
-
+	testExecutionArgs *core.TestExecutionArgs) (*core.ExecutionResults, error) {
 	azureReader, azureWriter := io.Pipe()
 	defer azureWriter.Close()
-	blobPath := fmt.Sprintf("%s/%s/%s/%s.log", payload.OrgID, payload.BuildID, payload.TaskID, core.Execution)
-	errChan := tes.execManager.StoreCommandLogs(ctx, blobPath, azureReader)
+
+	errChan := testExecutionArgs.LogWriterStrategy.Write(ctx, azureReader)
 	defer tes.closeAndWriteLog(azureWriter, errChan)
 	logWriter := lumber.NewWriter(tes.logger)
+	defer logWriter.Close()
 	multiWriter := io.MultiWriter(logWriter, azureWriter)
-	maskWriter := logstream.NewMasker(multiWriter, secretData)
+	maskWriter := logstream.NewMasker(multiWriter, testExecutionArgs.SecretData)
 
-	var target []string
-	var envMap map[string]string
-	if payload.EventType == core.EventPullRequest {
-		target = tasConfig.Premerge.Patterns
-		envMap = tasConfig.Premerge.EnvMap
-	} else {
-		target = tasConfig.Postmerge.Patterns
-		envMap = tasConfig.Postmerge.EnvMap
-	}
-	var args []string
-	args = []string{global.FrameworkRunnerMap[tasConfig.Framework], "--command", "execute"}
-	if tasConfig.ConfigFile != "" {
-		args = append(args, "--config", tasConfig.ConfigFile)
-	}
-	for _, pattern := range target {
-		args = append(args, "--pattern", pattern)
+	args, err := tes.buildCmdArgs(ctx, testExecutionArgs.TestConfigFile,
+		testExecutionArgs.FrameWork, testExecutionArgs.FrameWorkVersion, testExecutionArgs.Payload, testExecutionArgs.TestPattern)
+	if err != nil {
+		return nil, err
 	}
 
-	if payload.LocatorAddress != "" {
-		locatorFile, err := tes.getLocatorsFile(ctx, payload.LocatorAddress)
-		tes.logger.Debugf("locators : %v\n", locatorFile)
-		if err != nil {
-			tes.logger.Errorf("failed to get locator file, error: %v", err)
-			return nil, err
-		}
-		args = append(args, "--locator-file", locatorFile)
-	}
-
+	payload := testExecutionArgs.Payload
 	collectCoverage := payload.CollectCoverage
 	commandArgs := args
-	envVars, err := tes.execManager.GetEnvVariables(envMap, secretData)
+	envVars, err := tes.execManager.GetEnvVariables(testExecutionArgs.EnvMap, testExecutionArgs.SecretData)
 	if err != nil {
 		tes.logger.Errorf("failed to parse env variables, error: %v", err)
 		return nil, err
@@ -112,7 +86,7 @@ func (tes *testExecutionService) Run(ctx context.Context,
 	}
 	for i := 1; i <= tes.cfg.ConsecutiveRuns; i++ {
 		var cmd *exec.Cmd
-		if tasConfig.Framework == "jasmine" || tasConfig.Framework == "mocha" {
+		if testExecutionArgs.FrameWork == "jasmine" || testExecutionArgs.FrameWork == "mocha" {
 			if collectCoverage {
 				cmd = exec.CommandContext(ctx, "nyc", commandArgs...)
 			} else {
@@ -124,7 +98,7 @@ func (tes *testExecutionService) Run(ctx context.Context,
 				envVars = append(envVars, "TAS_COLLECT_COVERAGE=true")
 			}
 		}
-		cmd.Dir = global.RepoDir
+		cmd.Dir = testExecutionArgs.CWD
 		cmd.Env = envVars
 		cmd.Stdout = maskWriter
 		cmd.Stderr = maskWriter
@@ -156,6 +130,17 @@ func (tes *testExecutionService) Run(ctx context.Context,
 	return executionResults, nil
 }
 
+func getPatternAndEnvV1(payload *core.Payload, tasConfig *core.TASConfig) (target []string, envMap map[string]string) {
+	if payload.EventType == core.EventPullRequest {
+		target = tasConfig.Premerge.Patterns
+		envMap = tasConfig.Premerge.EnvMap
+	} else {
+		target = tasConfig.Postmerge.Patterns
+		envMap = tasConfig.Postmerge.EnvMap
+	}
+	return target, envMap
+}
+
 func (tes *testExecutionService) SendResults(ctx context.Context,
 	payload *core.ExecutionResults) (resp *core.TestReportResponsePayload, err error) {
 	reqBody, err := json.Marshal(payload)
@@ -163,7 +148,8 @@ func (tes *testExecutionService) SendResults(ctx context.Context,
 		tes.logger.Errorf("failed to marshal request body %v", err)
 		return nil, err
 	}
-	respBody, err := tes.requests.MakeAPIRequest(ctx, http.MethodPost, tes.serverEndpoint, reqBody)
+	query, headers := utils.GetDefaultQueryAndHeaders()
+	respBody, _, err := tes.requests.MakeAPIRequest(ctx, http.MethodPost, tes.serverEndpoint, reqBody, query, headers)
 	if err != nil {
 		tes.logger.Errorf("error while sending reports %v", err)
 		return nil, err
@@ -180,20 +166,9 @@ func (tes *testExecutionService) SendResults(ctx context.Context,
 }
 
 func (tes *testExecutionService) getLocatorsFile(ctx context.Context, locatorAddress string) (string, error) {
-	u, err := url.Parse(locatorAddress)
+	resp, err := tes.azureClient.FindUsingSASUrl(ctx, locatorAddress)
 	if err != nil {
-		return "", err
-	}
-	// string the container name to get blob path
-	blobPath := strings.Replace(u.Path, fmt.Sprintf("/%s/", core.PayloadContainer), "", -1)
-
-	sasURL, err := tes.azureClient.GetSASURL(ctx, blobPath, core.PayloadContainer)
-	if err != nil {
-		return "", err
-	}
-	resp, err := tes.azureClient.FindUsingSASUrl(ctx, sasURL)
-	if err != nil {
-		tes.logger.Errorf("Error while downloading cache for key: %s, error %v", u.Path, err)
+		tes.logger.Errorf("Error while downloading locatorFile, error %v", err)
 		return "", err
 	}
 	defer resp.Close()
@@ -216,4 +191,28 @@ func (tes *testExecutionService) closeAndWriteLog(azureWriter *io.PipeWriter, er
 	if err := <-errChan; err != nil {
 		tes.logger.Errorf("failed to upload logs for test execution, error: %v", err)
 	}
+}
+
+func (tes *testExecutionService) buildCmdArgs(ctx context.Context,
+	testConfigFile string,
+	frameWork string,
+	frameworkVersion int,
+	payload *core.Payload,
+	target []string) ([]string, error) {
+	args := []string{global.FrameworkRunnerMap[frameWork]}
+
+	args = append(args, utils.GetArgs("execute", frameWork, frameworkVersion, testConfigFile, target)...)
+
+	if payload.LocatorAddress != "" {
+		locatorFile, err := tes.getLocatorsFile(ctx, payload.LocatorAddress)
+		tes.logger.Debugf("locators : %v\n", locatorFile)
+		if err != nil {
+			tes.logger.Errorf("failed to get locator file, error: %v", err)
+			return nil, err
+		}
+
+		args = append(args, global.ArgLocator, locatorFile)
+	}
+
+	return args, nil
 }

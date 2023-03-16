@@ -5,36 +5,23 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"strings"
 	"testing"
 
+	"github.com/LambdaTest/test-at-scale/mocks"
 	"github.com/LambdaTest/test-at-scale/pkg/command"
 	"github.com/LambdaTest/test-at-scale/pkg/core"
 	"github.com/LambdaTest/test-at-scale/pkg/global"
 	"github.com/LambdaTest/test-at-scale/pkg/lumber"
+	"github.com/LambdaTest/test-at-scale/pkg/requestutils"
 	"github.com/LambdaTest/test-at-scale/testutils"
-	"github.com/LambdaTest/test-at-scale/testutils/mocks"
+	"github.com/cenkalti/backoff/v4"
 	"github.com/stretchr/testify/mock"
 )
-
-func CreateDirectory(path string) {
-	if _, err := os.Stat(path); os.IsNotExist(err) {
-		if err := os.MkdirAll(path, 0755); err != nil {
-			fmt.Printf("Error: %v", err)
-		}
-	}
-}
-
-func removeFile(path string) {
-	err := os.RemoveAll(path)
-	if err != nil {
-		fmt.Println("error in removing!!")
-	}
-}
 
 func Test_downloadFile(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -75,6 +62,7 @@ func Test_downloadFile(t *testing.T) {
 		logger:      logger,
 		httpClient:  httpClient,
 		execManager: execManager,
+		request:     requestutils.New(logger, global.DefaultAPITimeout, &backoff.StopBackOff{}),
 	}
 	archiveURL := server.URL + "/archive/zipfile.zip"
 	fileName := "copyAndExtracted"
@@ -108,26 +96,35 @@ func Test_copyAndExtractFile(t *testing.T) {
 		logger:      logger,
 		httpClient:  httpClient,
 		execManager: execManager,
+		request:     requestutils.New(logger, global.DefaultAPITimeout, &backoff.StopBackOff{}),
 	}
 	fileBody := "Hello World!"
 	resp := http.Response{
-		Body: ioutil.NopCloser(bytes.NewBufferString(fileBody)),
+		Body: io.NopCloser(bytes.NewBufferString(fileBody)),
 	}
 	path := "newFile"
-	err2 := gm.copyAndExtractFile(context.TODO(), &resp, path)
-	if err2 != nil {
-		t.Errorf("Error: %v", err2)
-		return
-	}
-	fileContent, err := ioutil.ReadFile("./newFile")
+	defer removeFile(path)
+	respBodyBuffer := bytes.Buffer{}
+	_, err = io.Copy(&respBodyBuffer, resp.Body)
 	if err != nil {
 		t.Errorf("Error: %v", err)
 		return
 	}
+	err2 := gm.copyAndExtractFile(context.TODO(), respBodyBuffer.Bytes(), path)
+	if err2 != nil {
+		t.Errorf("Error: %v", err2)
+		return
+	}
+
+	fileContent, err := os.ReadFile("./newFile")
+	if err != nil {
+		t.Errorf("Error: %v", err)
+		return
+	}
+
 	if string(fileContent) != fileBody {
 		t.Errorf("Expected file content: %v\nReceived: %v", fileBody, string(fileContent))
 	}
-	defer removeFile(path)
 }
 
 func TestClone(t *testing.T) {
@@ -203,4 +200,11 @@ func TestClone(t *testing.T) {
 	t.Run("Check the clone function", func(t *testing.T) {
 		checkClone(t)
 	})
+}
+
+func removeFile(path string) {
+	err := os.RemoveAll(path)
+	if err != nil {
+		fmt.Println("error in removing!!")
+	}
 }

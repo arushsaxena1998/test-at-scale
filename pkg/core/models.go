@@ -4,7 +4,6 @@
 package core
 
 import (
-	"net/http"
 	"time"
 
 	"github.com/LambdaTest/test-at-scale/config"
@@ -14,14 +13,20 @@ import (
 // ExecutionID type
 type ExecutionID string
 
+// SASURLPurpose defines reasons for which SAS Url is required
+type SASURLPurpose string
+
+// SASURLPurpose values
+const (
+	PurposeCache          SASURLPurpose = "cache"
+	PurposeWorkspaceCache SASURLPurpose = "workspace_cache"
+	PurposePreRunLogs     SASURLPurpose = "pre_run_logs"
+	PurposePostRunLogs    SASURLPurpose = "post_run_logs"
+	PurposeExecutionLogs  SASURLPurpose = "execution_logs"
+)
+
 // Tier type of synapse
 type Tier string
-
-// CommandType defines type of command
-type CommandType string
-
-// ContainerType defines types of container
-type ContainerType string
 
 // TaskTier values.
 const (
@@ -50,6 +55,9 @@ const (
 	TestSplit SplitMode = "test"
 )
 
+// CommandType defines type of command
+type CommandType string
+
 // Types of Command string
 const (
 	PreRun          CommandType = "prerun"
@@ -62,13 +70,6 @@ const (
 	InstallNodeVer  CommandType = "installnodeversion"
 	InitGit         CommandType = "initgit"
 	RenameCloneFile CommandType = "renameclonefile"
-)
-
-// Types of containers
-const (
-	CacheContainer   ContainerType = "cache"
-	LogsContainer    ContainerType = "logs"
-	PayloadContainer ContainerType = "container-payload"
 )
 
 // EventType represents the webhook event
@@ -136,9 +137,8 @@ type Pipeline struct {
 	TestStats            TestStats
 	Task                 Task
 	SecretParser         SecretParser
-	HTTPClient           http.Client
+	Builder              Builder
 }
-
 type DiscoveryResult struct {
 	Tests           []TestPayload      `json:"tests"`
 	ImpactedTests   []string           `json:"impactedTests"`
@@ -152,8 +152,7 @@ type DiscoveryResult struct {
 	TaskID          string             `json:"taskID"`
 	OrgID           string             `json:"orgID"`
 	Branch          string             `json:"branch"`
-	Tier            Tier               `json:"tier"`
-	ContainerImage  string             `json:"containerImage"`
+	SubModule       string             `json:"subModule"`
 }
 
 // ExecutionResult represents the request body for test and test suite execution
@@ -303,7 +302,7 @@ type Oauth struct {
 // TASConfig represents the .tas.yml file
 type TASConfig struct {
 	SmartRun          bool               `yaml:"smartRun"`
-	Framework         string             `yaml:"framework" validate:"required,oneof=jest mocha jasmine"`
+	Framework         string             `yaml:"framework" validate:"required,oneof=jest mocha jasmine golang junit"`
 	Blocklist         []string           `yaml:"blocklist"`
 	Postmerge         *Merge             `yaml:"postMerge" validate:"omitempty"`
 	Premerge          *Merge             `yaml:"preMerge" validate:"omitempty"`
@@ -318,6 +317,8 @@ type TASConfig struct {
 	Tier              Tier               `yaml:"tier" validate:"oneof=xsmall small medium large xlarge"`
 	NodeVersion       string             `yaml:"nodeVersion" validate:"omitempty,semver"`
 	ContainerImage    string             `yaml:"containerImage"`
+	FrameworkVersion  int                `yaml:"frameworkVersion" validate:"omitempty"`
+	Version           string             `yaml:"version" validate:"required"`
 }
 
 // CoverageThreshold reprents the code coverage threshold
@@ -376,3 +377,106 @@ const (
 	Blocklisted TestStatus = "blocklisted"
 	Quarantined TestStatus = "quarantined"
 )
+
+// TASConfigV2 repersent TASConfig for version 2 and above
+type TASConfigV2 struct {
+	SmartRun          bool               `yaml:"smartRun"`
+	Cache             *Cache             `yaml:"cache" validate:"omitempty"`
+	Tier              Tier               `yaml:"tier" validate:"oneof=xsmall small medium large xlarge"`
+	PostMerge         *MergeV2           `yaml:"postMerge" validate:"omitempty"`
+	PreMerge          *MergeV2           `yaml:"preMerge" validate:"omitempty"`
+	SkipCache         bool               `yaml:"skipCache"`
+	CoverageThreshold *CoverageThreshold `yaml:"coverageThreshold" validate:"omitempty"`
+	Parallelism       int                `yaml:"parallelism"` // TODO: will be supported later
+	Version           string             `yaml:"version" validate:"required"`
+	SplitMode         SplitMode          `yaml:"splitMode" validate:"oneof=test file"`
+	ContainerImage    string             `yaml:"containerImage"`
+	NodeVersion       string             `yaml:"nodeVersion" validate:"omitempty,semver"`
+}
+
+// MergeV2 repersent MergeConfig for version 2 and above
+type MergeV2 struct {
+	PreRun     *Run              `yaml:"preRun" validate:"omitempty"`
+	SubModules []SubModule       `yaml:"subModules" validate:"required,gt=0"`
+	EnvMap     map[string]string `yaml:"env" validate:"omitempty,gt=0"`
+}
+
+// SubModule represent the structure of subModule yaml v2
+type SubModule struct {
+	Name               string   `yaml:"name" validate:"required"`
+	Path               string   `yaml:"path" validate:"required"`
+	Patterns           []string `yaml:"pattern" validate:"required,gt=0"`
+	Framework          string   `yaml:"framework" validate:"required,oneof=jest mocha jasmine"`
+	Blocklist          []string `yaml:"blocklist"`
+	Prerun             *Run     `yaml:"preRun" validate:"omitempty"`
+	Postrun            *Run     `yaml:"postRun" validate:"omitempty"`
+	RunPrerunEveryTime bool     `yaml:"runPreRunEveryTime"`
+	Parallelism        int      `yaml:"parallelism"` // TODO: will be supported later
+	ConfigFile         string   `yaml:"configFile" validate:"omitempty"`
+}
+
+// TasVersion used to identify yaml version
+type TasVersion struct {
+	Version string `yaml:"version" validate:"required"`
+}
+
+// SubModuleList repersent submodule list API payload
+type SubModuleList struct {
+	BuildID        string `json:"buildID"`
+	TotalSubModule int    `json:"totalSubModule"`
+}
+
+// DiscoveyArgs specify the arguments for discovery
+type DiscoveyArgs struct {
+	TestPattern      []string
+	Payload          *Payload
+	EnvMap           map[string]string
+	SecretData       map[string]string
+	TestConfigFile   string
+	FrameWork        string
+	SmartRun         bool
+	Diff             map[string]int
+	DiffExists       bool
+	FrameWorkVersion int
+	CWD              string
+}
+
+// TestExecutionArgs specify the argument for test discovery
+type TestExecutionArgs struct {
+	Payload           *Payload
+	CoverageDir       string
+	LogWriterStrategy LogWriterStrategy
+	TestPattern       []string
+	EnvMap            map[string]string
+	TestConfigFile    string
+	FrameWork         string
+	SecretData        map[string]string
+	FrameWorkVersion  int
+	CWD               string
+}
+
+// YMLParsingRequestMessage defines yml parsing request received from TAS server
+type YMLParsingRequestMessage struct {
+	GitProvider string    `json:"gitProvider"`
+	CommitID    string    `json:"commitID"`
+	Event       EventType `json:"eventType"`
+	RepoSlug    string    `json:"repoSlug"`
+	TasFileName string    `json:"tasFilePath"`
+	LicenseTier Tier      `json:"license_tier"`
+	OrgID       string    `json:"orgID"`
+	BuildID     string    `json:"buildID"`
+}
+
+// TASConfigDownloaderOutput repersent output return by tasconfig downloader
+type TASConfigDownloaderOutput struct {
+	Version   int         `json:"version"`
+	TASConfig interface{} `json:"tasConfig"`
+}
+
+// YMLParsingResultMessage repersent message sent to TAS server in response of yml parsing request
+type YMLParsingResultMessage struct {
+	ErrorMsg  string                    `json:"ErrorMsg"`
+	OrgID     string                    `json:"orgID"`
+	BuildID   string                    `json:"buildID"`
+	YMLOutput TASConfigDownloaderOutput `json:"ymlOutput"`
+}

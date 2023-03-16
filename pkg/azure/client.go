@@ -1,16 +1,15 @@
 package azure
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"net/url"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob"
 
 	"github.com/LambdaTest/test-at-scale/config"
@@ -18,25 +17,27 @@ import (
 	"github.com/LambdaTest/test-at-scale/pkg/errs"
 	"github.com/LambdaTest/test-at-scale/pkg/global"
 	"github.com/LambdaTest/test-at-scale/pkg/lumber"
+	"github.com/LambdaTest/test-at-scale/pkg/utils"
 )
 
 var (
 	defaultBufferSize     = 3 * 1024 * 1024
 	defaultMaxBuffers     = 4
 	coverageContainerName = "coverage"
+	maxRetry              = 10
 )
 
-// Store represents the azure storage
-type Store struct {
+// store represents the azure storage
+type store struct {
+	requests        core.Requests
 	containerClient azblob.ContainerClient
-	httpClient      http.Client
 	logger          lumber.Logger
+	endpoint        string
 }
 
 // request body for getting SAS URL API.
 type request struct {
-	BlobPath string             `json:"blob_path"`
-	BlobType core.ContainerType `json:"blob_type"`
+	Purpose core.SASURLPurpose `json:"purpose" validate:"oneof=cache workspace_cache pre_run_logs post_run_logs execution_logs"`
 }
 
 //  response body for  get SAS URL API.
@@ -45,22 +46,21 @@ type response struct {
 }
 
 // NewAzureBlobEnv returns a new Azure blob store.
-func NewAzureBlobEnv(cfg *config.NucleusConfig, logger lumber.Logger) (core.AzureClient, error) {
+func NewAzureBlobEnv(cfg *config.NucleusConfig, requests core.Requests, logger lumber.Logger) (core.AzureClient, error) {
 	// if non coverage mode then use Azure SAS Token
 	if !cfg.CoverageMode {
-		return &Store{
-			logger: logger,
-			httpClient: http.Client{
-				Timeout: global.DefaultHTTPTimeout,
-			},
+		return &store{
+			requests: requests,
+			logger:   logger,
+			endpoint: global.NeuronHost + "/internal/sas-token",
 		}, nil
 	}
 	// FIXME: Hack for synapse
 	if cfg.LocalRunner {
-		cfg.Azure.StorageAccountName = "dummy"
-		cfg.Azure.StorageAccessKey = "dummy"
+		cfg.Azure.StorageAccountName = "dummy-account"
+		cfg.Azure.StorageAccessKey = "dummy-access-key"
 	}
-	if len(cfg.Azure.StorageAccountName) == 0 || len(cfg.Azure.StorageAccessKey) == 0 {
+	if cfg.Azure.StorageAccountName == "" || cfg.Azure.StorageAccessKey == "" {
 		return nil, errors.New("either the storage account or storage access key environment variable is not set")
 	}
 	credential, err := azblob.NewSharedKeyCredential(cfg.Azure.StorageAccountName, cfg.Azure.StorageAccessKey)
@@ -72,24 +72,22 @@ func NewAzureBlobEnv(cfg *config.NucleusConfig, logger lumber.Logger) (core.Azur
 	if err != nil {
 		return nil, err
 	}
-
-	serviceClient, err := azblob.NewServiceClientWithSharedKey(u.String(), credential, nil)
+	serviceClient, err := azblob.NewServiceClientWithSharedKey(u.String(), credential, getClientOptions())
 	if err != nil {
 		logger.Errorf("Failed to create azure service client, error: %v", err)
 		return nil, err
 	}
 
-	return &Store{
-		logger: logger,
-		httpClient: http.Client{
-			Timeout: global.DefaultHTTPTimeout,
-		},
+	return &store{
+		requests:        requests,
+		logger:          logger,
+		endpoint:        global.NeuronHost + "/internal/sas-token",
 		containerClient: serviceClient.NewContainerClient(coverageContainerName),
 	}, nil
 }
 
 // FindUsingSASUrl download object based on sasURL
-func (s *Store) FindUsingSASUrl(ctx context.Context, sasURL string) (io.ReadCloser, error) {
+func (s *store) FindUsingSASUrl(ctx context.Context, sasURL string) (io.ReadCloser, error) {
 	u, err := url.Parse(sasURL)
 	if err != nil {
 		return nil, err
@@ -109,12 +107,12 @@ func (s *Store) FindUsingSASUrl(ctx context.Context, sasURL string) (io.ReadClos
 }
 
 // CreateUsingSASURL creates object using sasURL
-func (s *Store) CreateUsingSASURL(ctx context.Context, sasURL string, reader io.Reader, mimeType string) (string, error) {
+func (s *store) CreateUsingSASURL(ctx context.Context, sasURL string, reader io.Reader, mimeType string) (string, error) {
 	u, err := url.Parse(sasURL)
 	if err != nil {
 		return "", err
 	}
-	blobClient, err := azblob.NewBlockBlobClientWithNoCredential(u.String(), &azblob.ClientOptions{})
+	blobClient, err := azblob.NewBlockBlobClientWithNoCredential(u.String(), getClientOptions())
 	if err != nil {
 		s.logger.Errorf("failed to create blob client, error: %v", err)
 		return "", err
@@ -131,7 +129,7 @@ func (s *Store) CreateUsingSASURL(ctx context.Context, sasURL string, reader io.
 }
 
 // Find function downloads blob based on URI
-func (s *Store) Find(ctx context.Context, path string) (io.ReadCloser, error) {
+func (s *store) Find(ctx context.Context, path string) (io.ReadCloser, error) {
 	blobClient := s.containerClient.NewBlockBlobClient(path)
 	out, err := blobClient.Download(ctx, &azblob.DownloadBlobOptions{})
 	if err != nil {
@@ -143,7 +141,7 @@ func (s *Store) Find(ctx context.Context, path string) (io.ReadCloser, error) {
 }
 
 // Create function ulploads blob to URI
-func (s *Store) Create(ctx context.Context, path string, reader io.Reader, mimeType string) (string, error) {
+func (s *store) Create(ctx context.Context, path string, reader io.Reader, mimeType string) (string, error) {
 	blobClient := s.containerClient.NewBlockBlobClient(path)
 	_, err := blobClient.UploadStreamToBlockBlob(ctx, reader, azblob.UploadStreamToBlockBlobOptions{
 		HTTPHeaders: &azblob.BlobHTTPHeaders{BlobContentType: &mimeType},
@@ -155,35 +153,22 @@ func (s *Store) Create(ctx context.Context, path string, reader io.Reader, mimeT
 }
 
 // GetSASURL calls request neuron to get the SAS url
-func (s *Store) GetSASURL(ctx context.Context, containerPath string, containerType core.ContainerType) (string, error) {
-	reqPayload := &request{
-		BlobPath: containerPath,
-		BlobType: containerType,
-	}
+func (s *store) GetSASURL(ctx context.Context, purpose core.SASURLPurpose, query map[string]interface{}) (string, error) {
+	reqPayload := &request{Purpose: purpose}
 	reqBody, err := json.Marshal(reqPayload)
 	if err != nil {
 		s.logger.Errorf("failed to marshal request body %v", err)
 		return "", err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, fmt.Sprintf("%s/%s", global.NeuronHost, "internal/sas-token"), bytes.NewBuffer(reqBody))
-	if err != nil {
-		s.logger.Errorf("error while creating http request, error %v", err)
-		return "", err
+	defaultQuery, headers := utils.GetDefaultQueryAndHeaders()
+	for key, val := range defaultQuery {
+		if query == nil {
+			query = make(map[string]interface{})
+		}
+		query[key] = val
 	}
-	resp, err := s.httpClient.Do(req)
+	rawBytes, _, err := s.requests.MakeAPIRequest(ctx, http.MethodPost, s.endpoint, reqBody, query, headers)
 	if err != nil {
-		s.logger.Errorf("error while getting SAS URL, error %v", err)
-		return "", err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		s.logger.Errorf("error while getting SAS Token, status code %d", resp.StatusCode)
-		return "", errs.ErrAPIStatus
-	}
-
-	rawBytes, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		s.logger.Errorf("error while reading SAS token response, error %v", err)
 		return "", err
 	}
 	payload := new(response)
@@ -196,7 +181,7 @@ func (s *Store) GetSASURL(ctx context.Context, containerPath string, containerTy
 }
 
 // Exists checks the blob if exists
-func (s *Store) Exists(ctx context.Context, path string) (bool, error) {
+func (s *store) Exists(ctx context.Context, path string) (bool, error) {
 	blobClient := s.containerClient.NewBlockBlobClient(path)
 	get, err := blobClient.GetProperties(ctx, &azblob.GetBlobPropertiesOptions{})
 	if err != nil {
@@ -213,11 +198,18 @@ func handleError(err error) error {
 	}
 	var errResp *azblob.StorageError
 	if internalErr, ok := err.(*azblob.InternalError); ok && internalErr.As(&errResp) {
-		switch errResp.ErrorCode { // Compare serviceCode to ServiceCodeXxx constants
-		case azblob.StorageErrorCodeBlobNotFound:
+		if errResp.ErrorCode == azblob.StorageErrorCodeBlobNotFound {
 			return errs.ErrNotFound
 		}
 	}
 	return err
+}
 
+func getClientOptions() *azblob.ClientOptions {
+	return &azblob.ClientOptions{
+		Retry: policy.RetryOptions{
+			MaxRetries: int32(maxRetry),
+			TryTimeout: global.DefaultAPITimeout,
+		},
+	}
 }

@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net/http"
 	"os"
 	"path/filepath"
 	"runtime/debug"
@@ -20,6 +19,7 @@ import (
 const (
 	endpointPostTestResults = "http://localhost:9876/results"
 	endpointPostTestList    = "http://localhost:9876/test-list"
+	languageJs              = "javascript"
 )
 
 // NewPipeline creates and returns a new Pipeline instance
@@ -27,9 +27,6 @@ func NewPipeline(cfg *config.NucleusConfig, logger lumber.Logger) (*Pipeline, er
 	return &Pipeline{
 		Cfg:    cfg,
 		Logger: logger,
-		HTTPClient: http.Client{
-			Timeout: 45 * time.Second,
-		},
 	}, nil
 }
 
@@ -37,7 +34,6 @@ func NewPipeline(cfg *config.NucleusConfig, logger lumber.Logger) (*Pipeline, er
 func (pl *Pipeline) Start(ctx context.Context) (err error) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-
 	startTime := time.Now()
 
 	pl.Logger.Debugf("Starting pipeline.....")
@@ -57,7 +53,7 @@ func (pl *Pipeline) Start(ctx context.Context) (err error) {
 	pl.Logger.Debugf("Payload for current task: %+v \n", *payload)
 
 	if pl.Cfg.CoverageMode {
-		if err := pl.CoverageService.MergeAndUpload(ctx, payload); err != nil {
+		if err = pl.CoverageService.MergeAndUpload(ctx, payload); err != nil {
 			pl.Logger.Fatalf("error while merge and upload coverage files %v", err)
 		}
 		os.Exit(0)
@@ -66,31 +62,16 @@ func (pl *Pipeline) Start(ctx context.Context) (err error) {
 	// set payload on pipeline object
 	pl.Payload = payload
 
-	taskPayload := &TaskPayload{
-		TaskID:      payload.TaskID,
-		BuildID:     payload.BuildID,
-		RepoSlug:    payload.RepoSlug,
-		RepoLink:    payload.RepoLink,
-		OrgID:       payload.OrgID,
-		RepoID:      payload.RepoID,
-		GitProvider: payload.GitProvider,
-		StartTime:   startTime,
-		Status:      Running,
-	}
-	if pl.Cfg.DiscoverMode {
-		taskPayload.Type = DiscoveryTask
-	} else if pl.Cfg.FlakyMode {
-		taskPayload.Type = FlakyTask
-	} else {
-		taskPayload.Type = ExecutionTask
-	}
+	taskPayload := pl.getTaskPayload(payload, startTime)
 	payload.TaskType = taskPayload.Type
 	pl.Logger.Infof("Running nucleus in %s mode", taskPayload.Type)
 
-	// marking task to running state
-	if err = pl.Task.UpdateStatus(context.Background(), taskPayload); err != nil {
-		pl.Logger.Fatalf("failed to update task status %v", err)
-	}
+	go func() {
+		// marking task to running state
+		if err = pl.Task.UpdateStatus(context.Background(), taskPayload); err != nil {
+			pl.Logger.Fatalf("failed to update task status %v", err)
+		}
+	}()
 
 	// update task status when pipeline exits
 	defer func() {
@@ -122,6 +103,13 @@ func (pl *Pipeline) Start(ctx context.Context) (err error) {
 		pl.Logger.Errorf("failed to get oauth secret %v", err)
 		return err
 	}
+	// read secrets
+	secretMap, err := pl.SecretParser.GetRepoSecret(global.RepoSecretPath)
+	if err != nil {
+		pl.Logger.Errorf("Error in fetching Repo secrets %v", err)
+		err = errs.New(errs.GenericErrRemark.Error())
+		return err
+	}
 	if pl.Cfg.DiscoverMode {
 		pl.Logger.Infof("Cloning repo ...")
 		err = pl.GitManager.Clone(ctx, pl.Payload, oauth)
@@ -133,26 +121,70 @@ func (pl *Pipeline) Start(ctx context.Context) (err error) {
 	} else {
 		pl.Logger.Debugf("Extracting workspace")
 		// Replicate workspace
-		if err = pl.CacheStore.ExtractWorkspace(ctx); err != nil {
+		// TODO this will be changed after parallel discovery support
+		if err = pl.CacheStore.ExtractWorkspace(ctx, ""); err != nil {
 			pl.Logger.Errorf("Error replicating workspace: %+v", err)
 			err = errs.New(errs.GenericErrRemark.Error())
 			return err
 		}
 	}
-
-	// load tas yaml file
-	tasConfig, err := pl.TASConfigManager.LoadAndValidate(ctx, payload.TasFileName, payload.EventType, payload.LicenseTier)
+	coverageDir := filepath.Join(global.CodeCoverageDir, payload.OrgID, payload.RepoID, payload.BuildTargetCommit)
+	if payload.CollectCoverage {
+		if err = fileutils.CreateIfNotExists(coverageDir, true); err != nil {
+			pl.Logger.Errorf("failed to create coverage directory %v", err)
+			err = errs.New(errs.GenericErrRemark.Error())
+			return err
+		}
+	}
+	filePath, err := pl.TASConfigManager.GetTasConfigFilePath(pl.Payload)
+	if err != nil {
+		return err
+	}
+	version, err := pl.TASConfigManager.GetVersion(filePath)
 	if err != nil {
 		pl.Logger.Errorf("Unable to load tas yaml file, error: %v", err)
 		err = &errs.StatusFailed{Remark: err.Error()}
 		return err
 	}
+	pl.Logger.Infof("TAS Version %f", version)
+	pl.setEnv(payload, coverageDir)
+	newDriver, err := pl.Builder.GetDriver(version, filePath)
+	if err != nil {
+		pl.Logger.Errorf("error crearing driver, error %v", err)
+		return err
+	}
+	if pl.Cfg.DiscoverMode {
+		err = newDriver.RunDiscovery(ctx, payload, taskPayload, oauth, coverageDir, secretMap)
+	} else {
+		err = newDriver.RunExecution(ctx, payload, taskPayload, oauth, coverageDir, secretMap)
+	}
 
-	coverageDir := filepath.Join(global.CodeCoverageDir, payload.OrgID, payload.RepoID, payload.BuildTargetCommit)
-	cacheKey := fmt.Sprintf("%s/%s/%s", payload.OrgID, payload.RepoID, tasConfig.Cache.Key)
+	return err
+}
 
-	pl.Logger.Infof("Tas yaml: %+v", tasConfig)
+func (pl *Pipeline) getTaskPayload(payload *Payload, startTime time.Time) *TaskPayload {
+	taskPayload := &TaskPayload{
+		TaskID:      payload.TaskID,
+		BuildID:     payload.BuildID,
+		RepoSlug:    payload.RepoSlug,
+		RepoLink:    payload.RepoLink,
+		OrgID:       payload.OrgID,
+		RepoID:      payload.RepoID,
+		GitProvider: payload.GitProvider,
+		StartTime:   startTime,
+		Status:      Running,
+	}
+	if pl.Cfg.DiscoverMode {
+		taskPayload.Type = DiscoveryTask
+	} else if pl.Cfg.FlakyMode {
+		taskPayload.Type = FlakyTask
+	} else {
+		taskPayload.Type = ExecutionTask
+	}
+	return taskPayload
+}
 
+func (pl *Pipeline) setEnv(payload *Payload, coverageDir string) {
 	// set testing taskID, orgID and buildID as environment variable
 	os.Setenv("TASK_ID", payload.TaskID)
 	os.Setenv("ORG_ID", payload.OrgID)
@@ -169,143 +201,7 @@ func (pl *Pipeline) Start(ctx context.Context) (err error) {
 	os.Setenv("ENDPOINT_POST_TEST_RESULTS", endpointPostTestResults)
 	os.Setenv("REPO_ROOT", global.RepoDir)
 	os.Setenv("BLOCK_TESTS_FILE", global.BlockTestFileLocation)
-
-	if tasConfig.NodeVersion != "" {
-		nodeVersion := tasConfig.NodeVersion
-		// Running the `source` commands in a directory where .nvmrc is present, exits with exitCode 3
-		// https://github.com/nvm-sh/nvm/issues/1985
-		// TODO [good-to-have]: Auto-read and install from .nvmrc file, if present
-		commands := []string{
-			"source /home/nucleus/.nvm/nvm.sh",
-			fmt.Sprintf("nvm install %s", nodeVersion),
-		}
-		pl.Logger.Infof("Using user-defined node version: %v", nodeVersion)
-		err = pl.ExecutionManager.ExecuteInternalCommands(ctx, InstallNodeVer, commands, "", nil, nil)
-		if err != nil {
-			pl.Logger.Errorf("Unable to install user-defined nodeversion %v", err)
-			err = errs.New(errs.GenericErrRemark.Error())
-			return err
-		}
-		origPath := os.Getenv("PATH")
-		os.Setenv("PATH", fmt.Sprintf("/home/nucleus/.nvm/versions/node/v%s/bin:%s", nodeVersion, origPath))
-	}
-
-	if payload.CollectCoverage {
-		if err = fileutils.CreateIfNotExists(coverageDir, true); err != nil {
-			pl.Logger.Errorf("failed to create coverage directory %v", err)
-			err = errs.New(errs.GenericErrRemark.Error())
-			return err
-		}
-	}
-
-	// read secrets
-	secretMap, err := pl.SecretParser.GetRepoSecret(global.RepoSecretPath)
-	if err != nil {
-		pl.Logger.Errorf("Error in fetching Repo secrets %v", err)
-		err = errs.New(errs.GenericErrRemark.Error())
-		return err
-	}
-
-	if pl.Cfg.DiscoverMode {
-		err = pl.BlockTestService.GetBlockTests(ctx, tasConfig, payload.RepoID, payload.BranchName)
-		if err != nil {
-			pl.Logger.Errorf("Unable to fetch blocklisted tests: %v", err)
-			err = errs.New(errs.GenericErrRemark.Error())
-			return err
-		}
-
-		if err = pl.CacheStore.Download(ctx, cacheKey); err != nil {
-			pl.Logger.Errorf("Unable to download cache: %v", err)
-			err = errs.New(errs.GenericErrRemark.Error())
-			return err
-		}
-
-		if tasConfig.Prerun != nil {
-			pl.Logger.Infof("Running pre-run steps")
-			err = pl.ExecutionManager.ExecuteUserCommands(ctx, PreRun, payload, tasConfig.Prerun, secretMap)
-			if err != nil {
-				pl.Logger.Errorf("Unable to run pre-run steps %v", err)
-				err = &errs.StatusFailed{Remark: "Failed in running pre-run steps"}
-				return err
-			}
-		}
-		err = pl.ExecutionManager.ExecuteInternalCommands(ctx, InstallRunners, global.InstallRunnerCmds, global.RepoDir, nil, nil)
-		if err != nil {
-			pl.Logger.Errorf("Unable to install custom runners %v", err)
-			err = errs.New(errs.GenericErrRemark.Error())
-			return err
-		}
-
-		pl.Logger.Debugf("Caching workspace")
-		// Persist workspace
-		if err = pl.CacheStore.CacheWorkspace(ctx); err != nil {
-			pl.Logger.Errorf("Error caching workspace: %+v", err)
-			err = errs.New(errs.GenericErrRemark.Error())
-			return err
-		}
-
-		pl.Logger.Infof("Identifying changed files ...")
-		diffExists := true
-		diff, err := pl.DiffManager.GetChangedFiles(ctx, payload, oauth)
-		if err != nil {
-			if errors.Is(err, errs.ErrGitDiffNotFound) {
-				diffExists = false
-			} else {
-				pl.Logger.Errorf("Unable to identify changed files %s", err)
-				err = errs.New("Error occurred in fetching diff from GitHub")
-				return err
-			}
-		}
-
-		// discover test cases
-		err = pl.TestDiscoveryService.Discover(ctx, tasConfig, pl.Payload, secretMap, diff, diffExists)
-		if err != nil {
-			pl.Logger.Errorf("Unable to perform test discovery: %+v", err)
-			err = &errs.StatusFailed{Remark: "Failed in discovering tests"}
-			return err
-		}
-		// mark status as passed
-		taskPayload.Status = Passed
-
-		// Upload cache once for other builds
-		if err = pl.CacheStore.Upload(ctx, cacheKey, tasConfig.Cache.Paths...); err != nil {
-			pl.Logger.Errorf("Unable to upload cache: %v", err)
-			err = errs.New(errs.GenericErrRemark.Error())
-			return err
-		}
-		pl.Logger.Debugf("Cache uploaded successfully")
-	}
-
-	if pl.Cfg.ExecuteMode || pl.Cfg.FlakyMode {
-		// execute test cases
-		executionResults, err := pl.TestExecutionService.Run(ctx, tasConfig, pl.Payload, coverageDir, secretMap)
-		if err != nil {
-			pl.Logger.Infof("Unable to perform test execution: %v", err)
-			err = &errs.StatusFailed{Remark: "Failed in executing tests."}
-			if executionResults == nil {
-				return err
-			}
-		}
-
-		resp, err := pl.TestExecutionService.SendResults(ctx, executionResults)
-		if err != nil {
-			pl.Logger.Errorf("error while sending test reports %v", err)
-			err = errs.New(errs.GenericErrRemark.Error())
-			return err
-		}
-		taskPayload.Status = resp.TaskStatus
-
-		if tasConfig.Postrun != nil {
-			pl.Logger.Infof("Running post-run steps")
-			err = pl.ExecutionManager.ExecuteUserCommands(ctx, PostRun, payload, tasConfig.Postrun, secretMap)
-			if err != nil {
-				pl.Logger.Errorf("Unable to run post-run steps %v", err)
-				err = &errs.StatusFailed{Remark: "Failed in running post-run steps."}
-				return err
-			}
-		}
-	}
-	pl.Logger.Debugf("Completed pipeline")
-
-	return nil
+	os.Setenv(global.SubModuleName, pl.Cfg.SubModule)
+	// set MODULE_PATH to empty as env variable
+	os.Setenv(global.ModulePath, "")
 }
